@@ -29,17 +29,23 @@
 #include "resource.h"
 
 #define APP_NAME L"MarkPeek"
-#define APP_VERSION L"1.0.0"
+#define APP_VERSION L"1.1.0"
 
 static HWND g_hwnd = NULL;
 static HWND g_hwndBrowser = NULL;
 static HWND g_hwndStatus = NULL;
 static IWebBrowser2* g_wb = NULL;
+static IOleInPlaceActiveObject* g_pioipa = NULL;
 static std::wstring g_currentPath;
 static std::wstring g_tempHtmlPath;
+static HWND g_hwndEdit = NULL;
+static HFONT g_hEditFont = NULL;
+static bool g_editing = false;
+static bool g_dirty = false;
 
-enum { IDM_OPEN = 1001, IDM_RELOAD, IDM_ASSOC, IDM_UNASSOC, IDM_EXIT, IDM_ABOUT };
-enum { IDC_STATUS = 2001 };
+enum { IDM_OPEN = 1001, IDM_RELOAD, IDM_ASSOC, IDM_UNASSOC, IDM_EXIT, IDM_ABOUT,
+       IDM_EDIT, IDM_SAVE };
+enum { IDC_STATUS = 2001, IDC_EDIT = 2002 };
 
 // ---------------------------------------------------------------------------
 // String / file helpers
@@ -248,7 +254,14 @@ static void SetStatus(const std::wstring& text) {
         SendMessageW(g_hwndStatus, SB_SETTEXT, 0, (LPARAM)text.c_str());
 }
 
+static bool PromptSaveIfDirty();
+static void LeaveEditMode(bool save, bool rerender);
+
 static void OpenFile(const std::wstring& path) {
+    if (g_editing) {
+        if (!PromptSaveIfDirty()) return;
+        LeaveEditMode(false, false);
+    }
     if (!FileExists(path)) {
         std::wstring msg = L"File not found:\n" + path;
         MessageBoxW(g_hwnd, msg.c_str(), APP_NAME, MB_OK | MB_ICONWARNING);
@@ -279,7 +292,7 @@ static void ShowWelcome() {
         L"A minimal, Typora-style Markdown viewer for Windows.\n\n"
         L"## Get started\n\n"
         L"- Press **Ctrl+O** or drag & drop a `.md` file into this window\n"
-        L"- Press **F5** to reload after editing the file\n"
+        L"- Press **F5** to reload, **Ctrl+E** to edit, **Ctrl+S** to save\n"
         L"- Right-click a `.md` file in Explorer -> **Open with** -> MarkPeek\n\n"
         L"## Features\n\n"
         L"- Clean, Typora-like design\n"
@@ -294,6 +307,78 @@ static void ShowWelcome() {
     ShowHtml(html);
     SetWindowTextW(g_hwnd, (std::wstring(APP_NAME) + L" - drop or open a Markdown file").c_str());
     SetStatus(L"Ready - open a .md file (Ctrl+O) or drop it here");
+}
+
+// ---------------------------------------------------------------------------
+// Edit mode (built-in editor)
+
+static void UpdateTitle() {
+    if (g_currentPath.empty()) return;
+    std::wstring t = BaseName(g_currentPath);
+    if (g_dirty) t += L" *";
+    t += L" - " APP_NAME;
+    SetWindowTextW(g_hwnd, t.c_str());
+}
+
+static bool SaveCurrentFile() {
+    if (!g_hwndEdit || g_currentPath.empty()) return false;
+    int len = GetWindowTextLengthW(g_hwndEdit);
+    std::wstring text(len, L'\0');
+    GetWindowTextW(g_hwndEdit, &text[0], len + 1);
+    std::string utf8 = WideToUtf8(text.c_str(), len);
+    std::ofstream out(g_currentPath.c_str(), std::ios::binary | std::ios::trunc);
+    if (!out) {
+        MessageBoxW(g_hwnd, (L"Could not write file:\n" + g_currentPath).c_str(),
+                    APP_NAME, MB_OK | MB_ICONERROR);
+        return false;
+    }
+    out.write(utf8.data(), (std::streamsize)utf8.size());
+    out.close();
+    g_dirty = false;
+    UpdateTitle();
+    SetStatus(L"Saved");
+    return true;
+}
+
+static bool PromptSaveIfDirty() {
+    if (!g_editing || !g_dirty) return true;
+    int r = MessageBoxW(g_hwnd, L"Save changes to the document?", APP_NAME,
+                        MB_YESNOCANCEL | MB_ICONQUESTION);
+    if (r == IDYES) return SaveCurrentFile();
+    return r == IDNO;
+}
+
+static void EnterEditMode() {
+    if (g_editing || !g_hwndEdit) return;
+    if (g_currentPath.empty()) {
+        SendMessageW(g_hwnd, WM_COMMAND, IDM_OPEN, 0);
+        if (g_currentPath.empty()) return;
+    }
+    std::string md = ReadFileUtf8(g_currentPath);
+    SetWindowTextW(g_hwndEdit, Utf8ToWide(md).c_str());
+    if (g_hwndBrowser) ShowWindow(g_hwndBrowser, SW_HIDE);
+    if (g_wb) g_wb->put_Visible(FALSE);
+    ShowWindow(g_hwndEdit, SW_SHOW);
+    SetFocus(g_hwndEdit);
+    SendMessageW(g_hwndEdit, EM_SETSEL, 0, 0);
+    g_editing = true;
+    g_dirty = false;
+    UpdateTitle();
+    SetStatus(L"Editing - Ctrl+S to save, Ctrl+E to preview");
+}
+
+static void LeaveEditMode(bool save, bool rerender) {
+    if (!g_editing) return;
+    if (save && g_dirty) SaveCurrentFile();
+    ShowWindow(g_hwndEdit, SW_HIDE);
+    if (g_hwndBrowser) ShowWindow(g_hwndBrowser, SW_SHOW);
+    if (g_wb) g_wb->put_Visible(TRUE);
+    g_editing = false;
+    UpdateTitle();
+    if (rerender && !g_currentPath.empty())
+        OpenFile(g_currentPath);
+    else if (g_hwndBrowser)
+        SetFocus(g_hwndBrowser);
 }
 
 // ---------------------------------------------------------------------------
@@ -482,6 +567,7 @@ static void CreateBrowser(HWND hwnd) {
     g_wb->put_Left(0);
     g_wb->put_Top(0);
     g_wb->put_Visible(TRUE);
+    g_wb->QueryInterface(IID_IOleInPlaceActiveObject, (void**)&g_pioipa);
 }
 
 static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
@@ -491,6 +577,15 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
                                            L"", hwnd, IDC_STATUS);
         DragAcceptFiles(hwnd, TRUE);
         CreateBrowser(hwnd);
+        g_hwndEdit = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"",
+            WS_CHILD | ES_MULTILINE | ES_AUTOVSCROLL | ES_AUTOHSCROLL |
+            WS_VSCROLL | WS_HSCROLL | ES_WANTRETURN,
+            0, 0, 0, 0, hwnd, (HMENU)IDC_EDIT, GetModuleHandleW(NULL), NULL);
+        g_hEditFont = CreateFontW(-15, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
+            ANSI_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
+            CLEARTYPE_QUALITY, FIXED_PITCH, L"Consolas");
+        if (g_hwndEdit && g_hEditFont)
+            SendMessageW(g_hwndEdit, WM_SETFONT, (WPARAM)g_hEditFont, TRUE);
         return 0;
 
     case WM_SIZE:
@@ -509,6 +604,8 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
                 rc.bottom -= (sr.bottom - sr.top);
             }
             SetWindowPos(g_hwndBrowser, NULL, 0, 0, rc.right, rc.bottom, SWP_NOZORDER);
+            if (g_hwndEdit)
+                SetWindowPos(g_hwndEdit, NULL, 0, 0, rc.right, rc.bottom, SWP_NOZORDER);
         }
         return 0;
 
@@ -522,6 +619,13 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
     }
 
     case WM_COMMAND:
+        if (LOWORD(wParam) == IDC_EDIT && HIWORD(wParam) == EN_UPDATE) {
+            if (g_editing && !g_dirty) {
+                g_dirty = true;
+                UpdateTitle();
+            }
+            return 0;
+        }
         switch (LOWORD(wParam)) {
         case IDM_OPEN: {
             wchar_t file[MAX_PATH] = {0};
@@ -542,6 +646,20 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
         case IDM_RELOAD:
             if (!g_currentPath.empty())
                 OpenFile(g_currentPath);
+            return 0;
+        case IDM_EDIT:
+            if (g_editing) {
+                if (PromptSaveIfDirty())
+                    LeaveEditMode(false, true);
+            } else {
+                EnterEditMode();
+            }
+            return 0;
+        case IDM_SAVE:
+            if (g_editing)
+                SaveCurrentFile();
+            else
+                EnterEditMode();
             return 0;
         case IDM_ASSOC:
             SetAssociation(true);
@@ -569,9 +687,17 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
             g_wb->Release();
             g_wb = NULL;
         }
+        if (g_pioipa) {
+            g_pioipa->Release();
+            g_pioipa = NULL;
+        }
         if (g_site) {
             g_site->Release();
             g_site = NULL;
+        }
+        if (g_hEditFont) {
+            DeleteObject(g_hEditFont);
+            g_hEditFont = NULL;
         }
         if (!g_tempHtmlPath.empty()) {
             DeleteFileW(g_tempHtmlPath.c_str());
@@ -612,6 +738,9 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int nCmdShow) {
     AppendMenuW(fileMenu, MF_STRING, IDM_OPEN, L"&Open...\tCtrl+O");
     AppendMenuW(fileMenu, MF_STRING, IDM_RELOAD, L"&Reload\tF5");
     AppendMenuW(fileMenu, MF_SEPARATOR, 0, NULL);
+    AppendMenuW(fileMenu, MF_STRING, IDM_EDIT, L"&Edit / Preview\tCtrl+E");
+    AppendMenuW(fileMenu, MF_STRING, IDM_SAVE, L"&Save\tCtrl+S");
+    AppendMenuW(fileMenu, MF_SEPARATOR, 0, NULL);
     AppendMenuW(fileMenu, MF_STRING, IDM_ASSOC, L"Set as default viewer for &MD files");
     AppendMenuW(fileMenu, MF_STRING, IDM_UNASSOC, L"&Remove MD association");
     AppendMenuW(fileMenu, MF_SEPARATOR, 0, NULL);
@@ -627,10 +756,12 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int nCmdShow) {
     if (!g_hwnd) return 1;
 
     ACCEL accels[] = {
-        { FCONTROL, 'O', IDM_OPEN },
+        { FCONTROL | FVIRTKEY, 'O', IDM_OPEN },
         { FVIRTKEY, VK_F5, IDM_RELOAD },
+        { FCONTROL | FVIRTKEY, 'E', IDM_EDIT },
+        { FCONTROL | FVIRTKEY, 'S', IDM_SAVE },
     };
-    HACCEL hAccel = CreateAcceleratorTableW(accels, 2);
+    HACCEL hAccel = CreateAcceleratorTableW(accels, 4);
 
     int nArgs = 0;
     LPWSTR* argv = CommandLineToArgvW(GetCommandLineW(), &nArgs);
@@ -649,8 +780,13 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int nCmdShow) {
     MSG msg;
     while (GetMessageW(&msg, NULL, 0, 0)) {
         if (!TranslateAcceleratorW(g_hwnd, hAccel, &msg)) {
-            TranslateMessage(&msg);
-            DispatchMessageW(&msg);
+            BOOL handled = FALSE;
+            if (!g_editing && g_pioipa)
+                handled = (g_pioipa->TranslateAccelerator(&msg) == S_OK);
+            if (!handled) {
+                TranslateMessage(&msg);
+                DispatchMessageW(&msg);
+            }
         }
     }
 

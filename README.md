@@ -13,7 +13,9 @@ Clean rendering, zero dependencies, one portable `.exe`. Built for **Windows 7 S
 - UTF-8 / UTF-16LE / UTF-16BE files
 - Relative images next to the `.md` file are resolved automatically
 - Drag & drop a file onto the window, or open from the command line: `MarkPeek.exe readme.md`
-- `Ctrl+O` open, `F5` reload
+- `Ctrl+O` open, `F5` reload, `Ctrl+E` edit source, `Ctrl+S` save (UTF-8)
+- Built-in editor: press **Ctrl+E** to switch between preview and editing, **Ctrl+S** saves the file; unsaved changes are marked with `*` in the title bar and a save prompt protects you on exit
+- Hotkeys work in any keyboard layout (RU/EN)
 - Optional: set MarkPeek as the default viewer for `.md` files (per-user, no admin) — the file icon comes with it
 - Portable: no installer, no runtime dependencies, no registry writes except the optional file association
 
@@ -51,6 +53,7 @@ The result is `dist\MarkPeek.exe` — a single portable file.
 
 - **md4c** ([mity/md4c](https://github.com/mity/md4c), MIT) converts Markdown to HTML.
 - The HTML is rendered in an embedded **Internet Explorer (MSHTML)** control — present on every Windows 7/10 system, so the app needs no bundled browser engine.
+- Editing uses a native Win32 edit control (Consolas, UTF-8); `Ctrl+C`/`Ctrl+A` in the preview go through the browser engine natively.
 - A Typora-like theme is applied via embedded CSS (IE9-compatible).
 
 ## Project layout
