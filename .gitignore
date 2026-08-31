@@ -1,0 +1,4 @@
+dist/
+*.o
+*.exe
+Thumbs.db
