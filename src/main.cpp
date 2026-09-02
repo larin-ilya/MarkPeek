@@ -59,11 +59,6 @@ enum { IDC_STATUS = 2001 };
 #define DIRTY_TIMER_ID 1
 #define DIRTY_POLL_MS  250
 
-// Reserved riid for GetIDsOfNames/Invoke (ignored by the callee). GUID_NULL /
-// kNullIid become unavailable when INITGUID is defined, so define our own.
-static const GUID kNullIid = { 0x00000000, 0x0000, 0x0000,
-    { 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00 } };
-
 // ---------------------------------------------------------------------------
 // String / file helpers
 
@@ -589,14 +584,43 @@ function __mpBlock(n, depth, quote) {
     return __mpInline(n, false);
 }
 
+function __mpSetDirtyFlag() {
+    try { document.body.setAttribute("data-markpeek-dirty", "1"); } catch (e) {}
+    __mpDirty = true;
+}
+
+function __mpClearDirty() {
+    __mpDirty = false;
+    try { document.body.removeAttribute("data-markpeek-dirty"); } catch (e) {}
+}
+
 function __mpSetMode(on) {
     var c = document.getElementById("markpeek-content");
     if (!c) return;
     document.body.className = on ? "mp-editing" : "";
     c.contentEditable = on ? "true" : "false";
-    c.oninput = on ? function () { __mpDirty = true; } : null;
+    c.oninput = on ? __mpSetDirtyFlag : null;
     __mpDirty = false;
+    try { document.body.removeAttribute("data-markpeek-dirty"); } catch (e) {}
     try { c.focus(); } catch (e) {}
+}
+
+// Runs the DOM -> Markdown conversion and hands the result to the host.
+// Result is transported back BOTH as the execScript return value AND in
+// document.title (marker-prefixed) so the C++ side can read it reliably.
+// \x01 = ok (followed by the Markdown), \x02 = error (followed by the message).
+function __mpExport() {
+    try {
+        var md = __mpToMd();
+        __mpResult = md;
+        try { document.title = "\x01" + md; } catch (e) {}
+        return md;
+    } catch (e) {
+        var msg = (e && e.message) ? String(e.message) : String(e);
+        __mpResult = "";
+        try { document.title = "\x02" + msg; } catch (e2) {}
+        return "";
+    }
 }
 
 function __mpToMd() {
@@ -722,57 +746,75 @@ static bool JsEval(const wchar_t* code) {
     return SUCCEEDED(hr);
 }
 
-static IDispatch* GetWinDisp() {
+// Calls __mpExport() and returns the resulting Markdown. The JS hands the
+// result back as the execScript return value AND via document.title with a
+// marker byte, so we read it through plain COM calls (reliable in Trident):
+//   title[0]==1  -> OK, the rest of the title is the Markdown
+//   title[0]==2  -> error, the rest is the script error message
+// Returns false (and fills errMsg if known) when the export failed.
+static bool JsExportMarkdown(std::wstring& outMd, std::wstring& errMsg) {
+    outMd.clear();
+    errMsg.clear();
+
     IHTMLWindow2* w = GetWin();
-    if (!w) return NULL;
-    IDispatch* d = NULL;
-    w->QueryInterface(IID_IDispatch, (void**)&d);
-    w->Release();
-    return d;
-}
+    if (!w) { errMsg = L"document not ready (no window)"; return false; }
+    BSTR code = SysAllocString(L"__mpExport();");
+    BSTR lang = SysAllocString(L"javascript");
+    VARIANT ret;
+    VariantInit(&ret);
+    HRESULT hr = w->execScript(code, lang, &ret);
+    SysFreeString(code);
+    SysFreeString(lang);
 
-// Reads a boolean/string script variable. Returns false if not found.
-static bool JsReadVar(const wchar_t* name, bool* outBool, std::wstring* outStr) {
-    IDispatch* d = GetWinDisp();
-    if (!d) return false;
-    bool ok = false;
-    BSTR nb = SysAllocString(name);
-    OLECHAR* pNames[1] = { nb };
-    DISPID id;
-    if (SUCCEEDED(d->GetIDsOfNames(kNullIid, pNames, 1, LOCALE_USER_DEFAULT, &id))) {
-        VARIANT res;
-        VariantInit(&res);
-        if (SUCCEEDED(d->Invoke(id, kNullIid, LOCALE_USER_DEFAULT, DISPATCH_PROPERTYGET,
-                                NULL, &res, NULL, NULL))) {
-            if (outBool && res.vt == VT_BOOL) { *outBool = (res.boolVal != VARIANT_FALSE); ok = true; }
-            else if (outBool && res.vt == VT_I4) { *outBool = (res.lVal != 0); ok = true; }
-            else if (outBool && res.vt == VT_BSTR) { *outBool = _wcsicmp(res.bstrVal, L"true") == 0; ok = true; }
-            else if (outStr && res.vt == VT_BSTR && res.bstrVal) { *outStr = res.bstrVal; ok = true; }
-            VariantClear(&res);
-        }
+    // 1) try the execScript return value
+    if (SUCCEEDED(hr) && ret.vt == VT_BSTR && ret.bstrVal) {
+        outMd = ret.bstrVal;
+        VariantClear(&ret);
+        w->Release();
+        return true;
     }
-    SysFreeString(nb);
-    d->Release();
-    return ok;
-}
+    VariantClear(&ret);
 
-// Calls the JS serializer and returns the resulting Markdown (also read back
-// from __mpResult as a fallback).
-static bool JsSerializeMarkdown(std::wstring& outMd) {
-    if (!JsEval(L"__mpToMd();")) return false;
-    bool has = false;
-    std::wstring v;
-    if (JsReadVar(L"__mpResult", NULL, &v)) { outMd = v; has = true; }
-    if (has && !outMd.empty()) return true;
-    // fallback: try to read the returned value through a property read of __mpResult2
-    if (!has) outMd = L"";
-    return has;
-}
+    // 2) read document.title (marker transport)
+    IHTMLDocument2* d = NULL;
+    w->get_document(&d);           // window -> document
+    std::wstring title;
+    if (d) {
+        BSTR t = NULL;
+        if (SUCCEEDED(d->get_title(&t)) && t) { title = t; SysFreeString(t); }
+        d->Release();
+    }
+    w->Release();
 
-static bool JsGetDirty() {
-    bool b = false;
-    if (JsReadVar(L"__mpDirty", &b, NULL)) return b;
+    if (title.size() >= 1 && title[0] == 1) { outMd = title.substr(1); return true; }
+    if (title.size() >= 1 && title[0] == 2) { errMsg = title.substr(1); return false; }
+    errMsg = L"document not ready (no script result)";
     return false;
+}
+
+// Dirty state is flagged by the page on the <body> element's
+// data-markpeek-dirty attribute (read back through plain COM get_attribute).
+static bool JsGetDirty() {
+    IHTMLDocument2* d = GetDoc();
+    if (!d) return false;
+    IHTMLElement* body = NULL;
+    d->get_body(&body);
+    d->Release();
+    if (!body) return false;
+    VARIANT v;
+    VariantInit(&v);
+    bool dirty = false;
+    BSTR name = SysAllocString(L"data-markpeek-dirty");
+    HRESULT hr = name ? body->getAttribute(name, 0, &v) : E_FAIL;
+    if (SUCCEEDED(hr)) {
+        if (v.vt == VT_BSTR && v.bstrVal && wcscmp(v.bstrVal, L"1") == 0) dirty = true;
+        else if (v.vt == VT_I4 && v.lVal != 0) dirty = true;
+        else if (v.vt == VT_BOOL && v.boolVal != VARIANT_FALSE) dirty = true;
+    }
+    if (name) SysFreeString(name);
+    VariantClear(&v);
+    body->Release();
+    return dirty;
 }
 
 static void SetStatus(const std::wstring& text) {
@@ -796,15 +838,12 @@ static void EnterEditMode();
 static void LeaveEditMode();
 
 static bool SaveCurrentFile() {
-    if (g_currentPath.empty()) return false;
-    std::wstring mdW;
-    if (!g_editing) {   // Ctrl+S in preview: fall back to source read? we require edit mode
-        // try edit mode first
-        return false;
-    }
-    if (!JsSerializeMarkdown(mdW)) {
-        MessageBoxW(g_hwnd, L"Could not convert the edited document back to Markdown.",
-                    APP_NAME, MB_OK | MB_ICONERROR);
+    if (!g_editing || g_currentPath.empty()) return false;
+    std::wstring mdW, errMsg;
+    if (!JsExportMarkdown(mdW, errMsg)) {
+        std::wstring msg = L"Could not convert the edited document back to Markdown.";
+        if (!errMsg.empty()) msg += L"\n\nDetails: " + errMsg;
+        MessageBoxW(g_hwnd, msg.c_str(), APP_NAME, MB_OK | MB_ICONERROR);
         return false;
     }
     std::string utf8 = WideToUtf8(mdW.c_str(), (int)mdW.size());
@@ -1126,7 +1165,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
             if (JsGetDirty()) {
                 g_dirty = true;
                 UpdateTitle();
-                JsEval(L"__mpDirty = false;");
+                JsEval(L"__mpClearDirty();");
             }
         }
         return 0;
