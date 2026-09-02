@@ -606,19 +606,21 @@ function __mpSetMode(on) {
 }
 
 // Runs the DOM -> Markdown conversion and hands the result to the host.
-// Result is transported back BOTH as the execScript return value AND in
-// document.title (marker-prefixed) so the C++ side can read it reliably.
-// \x01 = ok (followed by the Markdown), \x02 = error (followed by the message).
+// document.title collapses newlines, so the result is stored in a BODY
+// ATTRIBUTE (newlines are preserved there) and read back via getAttribute:
+//   success -> data-markpeek-result = "<markdown>"   (data-markpeek-error removed)
+//   error   -> data-markpeek-error = "<message>"     (data-markpeek-result removed)
 function __mpExport() {
     try {
         var md = __mpToMd();
         __mpResult = md;
-        try { document.title = "\x01" + md; } catch (e) {}
+        document.body.setAttribute("data-markpeek-result", md);
+        document.body.removeAttribute("data-markpeek-error");
         return md;
     } catch (e) {
         var msg = (e && e.message) ? String(e.message) : String(e);
-        __mpResult = "";
-        try { document.title = "\x02" + msg; } catch (e2) {}
+        document.body.setAttribute("data-markpeek-error", msg);
+        document.body.removeAttribute("data-markpeek-result");
         return "";
     }
 }
@@ -746,11 +748,34 @@ static bool JsEval(const wchar_t* code) {
     return SUCCEEDED(hr);
 }
 
-// Calls __mpExport() and returns the resulting Markdown. The JS hands the
-// result back as the execScript return value AND via document.title with a
-// marker byte, so we read it through plain COM calls (reliable in Trident):
-//   title[0]==1  -> OK, the rest of the title is the Markdown
-//   title[0]==2  -> error, the rest is the script error message
+// Read a string attribute from the page's <body> element (plain COM
+// getAttribute, reliable in Trident). Attribute values preserve newlines.
+static bool GetBodyAttribute(const wchar_t* aname, std::wstring& out) {
+    out.clear();
+    IHTMLDocument2* d = GetDoc();
+    if (!d) return false;
+    IHTMLElement* body = NULL;
+    d->get_body(&body);
+    d->Release();
+    if (!body) return false;
+    VARIANT v;
+    VariantInit(&v);
+    BSTR n = SysAllocString(aname);
+    bool ok = false;
+    HRESULT hr = n ? body->getAttribute(n, 0, &v) : E_FAIL;
+    if (SUCCEEDED(hr) && v.vt == VT_BSTR && v.bstrVal) {
+        out = v.bstrVal;
+        ok = true;
+    }
+    if (n) SysFreeString(n);
+    VariantClear(&v);
+    body->Release();
+    return ok;
+}
+
+// Calls __mpExport() and returns the resulting Markdown.
+// The JS stores the full text (with newlines) in a <body> attribute
+// data-markpeek-result on success, or data-markpeek-error on failure.
 // Returns false (and fills errMsg if known) when the export failed.
 static bool JsExportMarkdown(std::wstring& outMd, std::wstring& errMsg) {
     outMd.clear();
@@ -766,55 +791,37 @@ static bool JsExportMarkdown(std::wstring& outMd, std::wstring& errMsg) {
     SysFreeString(code);
     SysFreeString(lang);
 
-    // 1) try the execScript return value
-    if (SUCCEEDED(hr) && ret.vt == VT_BSTR && ret.bstrVal) {
+    // 1) If execScript returned the text directly, use it (newlines intact).
+    if (SUCCEEDED(hr) && ret.vt == VT_BSTR && ret.bstrVal && SysStringLen(ret.bstrVal) > 0) {
         outMd = ret.bstrVal;
         VariantClear(&ret);
         w->Release();
         return true;
     }
     VariantClear(&ret);
-
-    // 2) read document.title (marker transport)
-    IHTMLDocument2* d = NULL;
-    w->get_document(&d);           // window -> document
-    std::wstring title;
-    if (d) {
-        BSTR t = NULL;
-        if (SUCCEEDED(d->get_title(&t)) && t) { title = t; SysFreeString(t); }
-        d->Release();
-    }
     w->Release();
 
-    if (title.size() >= 1 && title[0] == 1) { outMd = title.substr(1); return true; }
-    if (title.size() >= 1 && title[0] == 2) { errMsg = title.substr(1); return false; }
+    // 2) error reported by the page?
+    std::wstring ea;
+    if (GetBodyAttribute(L"data-markpeek-error", ea) && !ea.empty()) {
+        errMsg = ea;
+        return false;
+    }
+
+    // 3) success: read the result (newline-preserving) from the body attribute
+    std::wstring val;
+    if (GetBodyAttribute(L"data-markpeek-result", val)) { outMd = val; return true; }
+
     errMsg = L"document not ready (no script result)";
     return false;
 }
 
 // Dirty state is flagged by the page on the <body> element's
-// data-markpeek-dirty attribute (read back through plain COM get_attribute).
+// data-markpeek-dirty attribute.
 static bool JsGetDirty() {
-    IHTMLDocument2* d = GetDoc();
-    if (!d) return false;
-    IHTMLElement* body = NULL;
-    d->get_body(&body);
-    d->Release();
-    if (!body) return false;
-    VARIANT v;
-    VariantInit(&v);
-    bool dirty = false;
-    BSTR name = SysAllocString(L"data-markpeek-dirty");
-    HRESULT hr = name ? body->getAttribute(name, 0, &v) : E_FAIL;
-    if (SUCCEEDED(hr)) {
-        if (v.vt == VT_BSTR && v.bstrVal && wcscmp(v.bstrVal, L"1") == 0) dirty = true;
-        else if (v.vt == VT_I4 && v.lVal != 0) dirty = true;
-        else if (v.vt == VT_BOOL && v.boolVal != VARIANT_FALSE) dirty = true;
-    }
-    if (name) SysFreeString(name);
-    VariantClear(&v);
-    body->Release();
-    return dirty;
+    std::wstring v;
+    if (!GetBodyAttribute(L"data-markpeek-dirty", v)) return false;
+    return !v.empty() && v != L"0";
 }
 
 static void SetStatus(const std::wstring& text) {
