@@ -1,10 +1,15 @@
 @echo off
 rem ============================================================
-rem  MarkPeek build script (MinGW-W64 i686, C:\PORTABLE\mingw32)
+rem  MarkPeek build script (MinGW-W64 i686)
 rem  Usage: build.bat   -> produces dist\MarkPeek.exe
+rem  Uses C:\PORTABLE\mingw32 if present, else ..\mingw32 next to the repo.
 rem ============================================================
 setlocal
-set MINGW=C:\PORTABLE\mingw32
+if exist "C:\PORTABLE\mingw32\bin\gcc.exe" (
+    set MINGW=C:\PORTABLE\mingw32
+) else (
+    set MINGW=%~dp0..\mingw32
+)
 set ROOT=%~dp0
 set SRC=%ROOT%src
 set OUT=%ROOT%dist

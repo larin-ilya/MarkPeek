@@ -1,0 +1,35 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="256" height="256" viewBox="0 0 256 256">
+  <defs>
+    <linearGradient id="tile" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#4f46e5"/>
+      <stop offset="1" stop-color="#1e1b4b"/>
+    </linearGradient>
+    <radialGradient id="sheen" cx="0.25" cy="0.2" r="0.9">
+      <stop offset="0" stop-color="#ffffff" stop-opacity="0.22"/>
+      <stop offset="1" stop-color="#ffffff" stop-opacity="0"/>
+    </radialGradient>
+    <filter id="shadow" x="-30%" y="-30%" width="160%" height="160%">
+      <feDropShadow dx="0" dy="4" stdDeviation="6" flood-color="#000000" flood-opacity="0.28"/>
+    </filter>
+  </defs>
+
+  <!-- tile -->
+  <rect x="4" y="4" width="248" height="248" rx="56" fill="url(#tile)"/>
+  <rect x="4" y="4" width="248" height="248" rx="56" fill="url(#sheen)"/>
+  <rect x="4.5" y="4.5" width="247" height="247" rx="55" fill="none" stroke="#ffffff" stroke-opacity="0.12" stroke-width="2"/>
+
+  <!-- white card (the Markdown mark) -->
+  <g filter="url(#shadow)">
+    <rect x="50" y="66" width="156" height="124" rx="24" fill="#ffffff"/>
+  </g>
+
+  <!-- letter M (drawn as a thick polyline) -->
+  <path d="M 78 168 L 78 96 L 104 138 L 130 96 L 130 168"
+        fill="none" stroke="#312e81" stroke-width="13" stroke-linecap="round" stroke-linejoin="round"/>
+
+  <!-- down arrow ↓ resting on a baseline -->
+  <path d="M 164 104 L 164 154"
+        fill="none" stroke="#312e81" stroke-width="13" stroke-linecap="round"/>
+  <path d="M 164 160 L 146 140 L 182 140 Z" fill="#312e81" stroke-linejoin="round"/>
+  <rect x="140" y="166" width="48" height="8" rx="4" fill="#312e81"/>
+</svg>

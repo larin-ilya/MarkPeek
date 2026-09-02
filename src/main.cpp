@@ -1,16 +1,26 @@
-// MarkPeek — a minimal Typora-style Markdown viewer for Windows.
+// MarkPeek — a minimal Typora-style Markdown viewer/editor for Windows.
 // Win32 + embedded IE (MSHTML) + md4c renderer. MIT License.
 // Works on Windows 7 SP1 and Windows 10. Portable, 32-bit, no dependencies.
+//
+// Editing is WYSIWYG: the same rendered document becomes contenteditable,
+// so you edit exactly what you see (Typora style). Saving serializes the DOM
+// back to Markdown inside the page. Editing hotkeys (Ctrl+A/C/V/X/Z ...) are
+// handled natively by the browser engine, so they work in any keyboard layout.
 
 #define WIN32_LEAN_AND_MEAN
 #define UNICODE
 #define _UNICODE
+// Emit GUID definitions (IID_IHTMLDocument2 etc.) into this translation unit
+// for MinGW, which does not export the MSHTML interface IIDs from a library.
+#define INITGUID
 
 #include <windows.h>
 #include <ole2.h>
 #include <exdisp.h>
 #include <oleidl.h>
 #include <ocidl.h>
+#include <oleauto.h>
+#include <mshtml.h>
 #include <commctrl.h>
 #include <commdlg.h>
 #include <shellapi.h>
@@ -29,7 +39,7 @@
 #include "resource.h"
 
 #define APP_NAME L"MarkPeek"
-#define APP_VERSION L"1.1.0"
+#define APP_VERSION L"1.2.0"
 
 static HWND g_hwnd = NULL;
 static HWND g_hwndBrowser = NULL;
@@ -38,14 +48,21 @@ static IWebBrowser2* g_wb = NULL;
 static IOleInPlaceActiveObject* g_pioipa = NULL;
 static std::wstring g_currentPath;
 static std::wstring g_tempHtmlPath;
-static HWND g_hwndEdit = NULL;
-static HFONT g_hEditFont = NULL;
 static bool g_editing = false;
 static bool g_dirty = false;
+static UINT_PTR g_dirtyTimer = 0;
 
 enum { IDM_OPEN = 1001, IDM_RELOAD, IDM_ASSOC, IDM_UNASSOC, IDM_EXIT, IDM_ABOUT,
        IDM_EDIT, IDM_SAVE };
-enum { IDC_STATUS = 2001, IDC_EDIT = 2002 };
+enum { IDC_STATUS = 2001 };
+
+#define DIRTY_TIMER_ID 1
+#define DIRTY_POLL_MS  250
+
+// Reserved riid for GetIDsOfNames/Invoke (ignored by the callee). GUID_NULL /
+// kNullIid become unavailable when INITGUID is defined, so define our own.
+static const GUID kNullIid = { 0x00000000, 0x0000, 0x0000,
+    { 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00 } };
 
 // ---------------------------------------------------------------------------
 // String / file helpers
@@ -171,7 +188,9 @@ static std::string EscapeHtml(const std::string& s) {
     return out;
 }
 
+// ---------------------------------------------------------------------------
 // Typora-like default theme CSS (IE9-compatible).
+
 static const char* kCss = R"CSS(
 * { box-sizing: border-box; }
 html, body { margin: 0; padding: 0; background: #ffffff; }
@@ -204,24 +223,443 @@ tr:nth-child(2n) { background: #f6f8fa; }
 input[type="checkbox"] { margin-right: 0.4em; }
 del { color: #6a737d; }
 sup { font-size: 0.75em; }
+/* ---- WYSIWYG editing ---- */
+body.mp-editing #markpeek-content { cursor: text; }
+body.mp-editing a, body.mp-editing img { pointer-events: none; }
+#markpeek-content[contenteditable="true"] { outline: none; }
 )CSS";
 
-static std::string BuildHtml(const std::string& bodyHtml, const std::wstring& titleW) {
+// ---------------------------------------------------------------------------
+// In-page JS: WYSIWYG helpers + HTML->Markdown serializer (runs in Trident).
+// IE11-compatible only (no arrow functions / let / includes).
+
+static const char* kEditorJs = R"JS(
+var __mpDirty = false;
+var __mpResult = "";
+var __mpBase = "";   // "file:///.../<dir>/" of the current file (forward slashes), "" for welcome
+
+function __mpEscapeInline(text, inCell) {
+    var esc = "";
+    for (var i = 0; i < text.length; i++) {
+        var ch = text.charAt(i);
+        if (ch === "\\" || ch === "`" || ch === "<" || ch === ">") esc += "\\" + ch;
+        else if (inCell && ch === "|") esc += "\\|";
+        else esc += ch;
+    }
+    return esc;
+}
+
+// Escape only characters that would start a block construct at line start.
+function __mpSafeLineStart(s) {
+    if (/^#{1,6}(?=\s|$)/.test(s) || /^>(?=\s|$)/.test(s) ||
+        /^[-+*](?=\s|$)/.test(s) || /^\d+[.)](?=\s|$)/.test(s)) return "\\" + s;
+    return s;
+}
+
+// A plain text node that stands alone as a block (escaped + line-start-safe).
+function __mpPlainTextBlock(v) {
+    var s = v.replace(/\s+/g, " ").replace(/^ | $/g, "");
+    if (s === "") return "";
+    s = __mpEscapeInline(s, false);
+    return __mpSafeLineStart(s);
+}
+
+function __mpCodeSpan(text) {
+    var s = text;
+    if (s.indexOf("`") < 0) return "`" + s + "`";
+    if (s.indexOf("``") < 0) return "`` " + s + " ``";
+    if (s.indexOf("```") < 0) return "``` " + s + " ```";
+    return "<code>" + s + "</code>";
+}
+
+function __mpSupText(el) {
+    var a = el.getElementsByTagName("a");
+    if (a && a.length > 0) {
+        var href = a[0].getAttribute("href") || "";
+        var m = /^#fn-(\d+)$/.exec(href);
+        if (m) return "[^" + m[1] + "]";
+    }
+    return "[" + el.textContent + "]";
+}
+
+function __mpImgText(el) {
+    var src = el.getAttribute("src") || "";
+    var alt = el.getAttribute("alt") || "";
+    var title = el.getAttribute("title") || "";
+    if (__mpBase !== "" && src.indexOf("file:///") === 0) {
+        var dec = src.split("%20").join(" ");
+        if (dec.indexOf(__mpBase) === 0) src = dec.substring(__mpBase.length);
+    }
+    src = src.split("%20").join(" ").split("(").join("%28").split(")").join("%29");
+    var out = "![" + alt + "](" + src;
+    if (title !== "") out += " \"" + title.split("\"").join("\\\"") + "\"";
+    out += ")";
+    return out;
+}
+
+// Serialize a single inline node (a text node or an inline element treated as
+// a child) to Markdown, applying the node's own emphasis/tag formatting.
+function __mpInlineNode(n, inCell, afterBr) {
+    if (n.nodeType === 3) {
+        var v = n.nodeValue;
+        if (afterBr) v = v.replace(/^[ \t]*\r?\n[ \t]*/, "");
+        return __mpEscapeInline(v, inCell);
+    }
+    if (n.nodeType !== 1) return "";
+    var tag = (n.tagName || "").toLowerCase();
+    if (tag === "br") return "  \n";
+    if (tag === "strong" || tag === "b") return "**" + __mpInline(n, inCell) + "**";
+    if (tag === "em" || tag === "i") return "*" + __mpInline(n, inCell) + "*";
+    if (tag === "del" || tag === "s" || tag === "strike") return "~~" + __mpInline(n, inCell) + "~~";
+    if (tag === "code") return __mpCodeSpan(n.textContent || "");
+    if (tag === "sup") return __mpSupText(n);
+    if (tag === "img") return __mpImgText(n);
+    if (tag === "a") {
+        var cls = n.className ? (" " + n.className + " ") : "";
+        if (cls.indexOf(" footnote-backref ") >= 0) return "";   // skip
+        var href = n.getAttribute("href") || "";
+        var title = n.getAttribute("title") || "";
+        var txt = __mpInline(n, inCell);
+        if (txt === "") return "";
+        var mid = "(" + href;
+        if (title !== "") mid += " \"" + title.split("\"").join("\\\"") + "\"";
+        mid += ")";
+        return "[" + txt + "]" + mid;
+    }
+    // span / font / u / unknown: unwrap, keep inner formatting
+    return __mpInline(n, inCell);
+}
+
+function __mpInline(el, inCell) {
+    var out = "";
+    var nodes = el.childNodes;
+    for (var i = 0; i < nodes.length; i++) {
+        var prevBr = i > 0 && nodes[i - 1].nodeType === 1 &&
+                     (nodes[i - 1].tagName || "").toLowerCase() === "br";
+        out += __mpInlineNode(nodes[i], inCell, prevBr);
+    }
+    return out;
+}
+
+function __mpParaText(n) {
+    var s = __mpInline(n, false);
+    var lines = s.split("\n");
+    for (var i = 0; i < lines.length; i++) lines[i] = __mpSafeLineStart(lines[i]);
+    s = lines.join("\n");
+    s = s.replace(/\s+$/g, "");
+    return s;
+}
+
+function __mpIndent(depth) {
+    var s = "";
+    for (var i = 0; i < depth; i++) s += "  ";
+    return s;
+}
+
+function __mpCodeBlock(n, depth) {
+    var code = n;
+    var cs = n.getElementsByTagName("code");
+    if (cs && cs.length > 0) code = cs[0];
+    var lang = "";
+    var cls = code.getAttribute ? (code.getAttribute("class") || "") : "";
+    cls = cls.replace(/^\s+|\s+$/g, "");
+    if (cls.indexOf("language-") === 0) lang = cls.substring(9); else lang = cls;
+    var txt = code.textContent || "";
+    txt = txt.replace(/\r\n/g, "\n").replace(/\r/g, "\n");
+    if (txt.charAt(0) === "\n") txt = txt.substring(1);
+    if (txt.charAt(txt.length - 1) === "\n") txt = txt.substring(0, txt.length - 1);
+    if (txt === "") return "```" + lang + "\n```";
+    if (txt.indexOf("```") < 0) return "```" + lang + "\n" + txt + "\n```";
+    var lines = txt.split("\n");
+    for (var i = 0; i < lines.length; i++) lines[i] = "    " + lines[i];
+    return lines.join("\n");
+}
+
+function __mpQuote(n, depth) {
+    var inner = [];
+    var kids = n.childNodes;
+    for (var i = 0; i < kids.length; i++) {
+        var k = kids[i];
+        if (k.nodeType === 3) {
+            var s = __mpPlainTextBlock(k.nodeValue);
+            if (s) inner.push(s);
+            continue;
+        }
+        if (k.nodeType !== 1) continue;
+        var b = __mpBlock(k, depth, true);
+        if (b !== null && b !== "") inner.push(b);
+    }
+    var res = [];
+    for (var j = 0; j < inner.length; j++) {
+        var lines = inner[j].split("\n");
+        for (var L = 0; L < lines.length; L++) res.push("> " + lines[L]);
+        if (j < inner.length - 1) res.push(">");
+    }
+    return res.join("\n");
+}
+
+function __mpList(n, depth) {
+    var ordered = (n.tagName || "").toLowerCase() === "ol";
+    var start = 1;
+    if (ordered) {
+        var st = n.getAttribute("start");
+        if (st !== null && st !== "") { var sv = parseInt(st, 10); if (!isNaN(sv)) start = sv; }
+    }
+    var lis = [];
+    var ch = n.childNodes;
+    for (var i = 0; i < ch.length; i++)
+        if (ch[i].nodeType === 1 && (ch[i].tagName || "").toLowerCase() === "li") lis.push(ch[i]);
+    var out = [];
+    for (var j = 0; j < lis.length; j++) {
+        var marker;
+        if (ordered) { marker = __mpIndent(depth) + start + ". "; start++; }
+        else marker = __mpIndent(depth) + "- ";
+        out.push(__mpLi(lis[j], depth, marker));
+    }
+    return out.join("\n");
+}
+
+function __mpIsBlockTag(tag) {
+    if (tag === "p" || tag === "div" || tag === "ul" || tag === "ol" ||
+        tag === "blockquote" || tag === "pre" || tag === "table" ||
+        tag === "hr") return true;
+    return /^h[1-6]$/.test(tag);
+}
+
+function __mpLi(li, depth, marker) {
+    var task = "";
+    if (li.className && ((" " + li.className + " ").indexOf(" task-list-item ") >= 0)) {
+        var inp = li.getElementsByTagName("input");
+        if (inp && inp.length > 0 && (inp[0].type || "checkbox") === "checkbox")
+            task = inp[0].checked ? "[x] " : "[ ] ";
+    }
+    var ind = __mpIndent(depth + 1);
+    var cur = "";       // current inline run (tight item paragraph)
+    var cont = [];      // continuation lines, in order {i, t}
+    var head = [];      // first lines from inline runs, in order (usually one)
+    var seen = false;
+
+    function flush() {
+        if (cur === "") return;
+        var lines = cur.split("\n");
+        head.push(lines[0]);
+        for (var q = 1; q < lines.length; q++) cont.push({ i: ind, t: lines[q] });
+        cur = "";
+    }
+
+    var kids = li.childNodes;
+    for (var j = 0; j < kids.length; j++) {
+        var k = kids[j];
+        if (k.nodeType === 3) {
+            // Skip structural newlines md4c leaves between block children.
+            if (/^[ \t]*\r?\n[ \t]*$/.test(k.nodeValue)) continue;
+            cur += __mpEscapeInline(k.nodeValue, false);
+            seen = true;
+            continue;
+        }
+        if (k.nodeType !== 1) continue;
+        var tag = (k.tagName || "").toLowerCase();
+        if (tag === "input") continue;
+        if (tag === "br") { cur += "  \n"; seen = true; continue; }
+        if (!__mpIsBlockTag(tag)) { cur += __mpInlineNode(k, false, false); seen = true; continue; }
+        flush();                        // genuine block child below the item text
+        if (tag === "ul" || tag === "ol") {
+            var nested = __mpList(k, depth + 1);
+            if (nested !== "") cont.push({ i: ind, t: nested });
+        } else {
+            var b = __mpBlock(k, depth + 1, false);
+            if (b !== null && b !== "") {
+                var bl = b.split("\n");
+                cont.push({ i: ind, t: bl[0] });
+                for (var x = 1; x < bl.length; x++) cont.push({ i: ind, t: bl[x] });
+            }
+        }
+        seen = true;
+    }
+    flush();
+
+    var firstLine = marker + task;
+    if (head.length) firstLine += head[0];
+    for (var h = 1; h < head.length; h++) cont.push({ i: ind, t: head[h] });
+    if (!seen) return firstLine;
+    if (cont.length === 0) return firstLine;
+    var out = firstLine;
+    for (var r = 0; r < cont.length; r++) {
+        var tl = cont[r].t.split("\n");
+        out += "\n" + cont[r].i + tl[0];
+        for (var u = 1; u < tl.length; u++) out += "\n" + (tl[u] === "" ? "" : cont[r].i + tl[u]);
+    }
+    return out;
+}
+
+function __mpTable(n) {
+    var trs = n.getElementsByTagName("tr");
+    var rows = [];
+    for (var i = 0; i < trs.length; i++) {
+        var tr = trs[i];
+        var ths = tr.getElementsByTagName("th");
+        var tds = tr.getElementsByTagName("td");
+        var cells = [];
+        if (ths.length) for (var a = 0; a < ths.length; a++)
+            cells.push({ v: __mpInline(ths[a], true), al: ths[a].getAttribute("align") || "" });
+        else if (tds.length) for (var b = 0; b < tds.length; b++)
+            cells.push({ v: __mpInline(tds[b], true), al: tds[b].getAttribute("align") || "" });
+        if (cells.length) rows.push(cells);
+    }
+    if (!rows.length) return "";
+    var out = [];
+    var header = rows[0];
+    var hd = [], sep = [];
+    for (var h = 0; h < header.length; h++) {
+        hd.push(" " + header[h].v + " ");
+        var al = header[h].al;
+        if (al === "center") sep.push(" :---: ");
+        else if (al === "right") sep.push(" ---: ");
+        else sep.push(" --- ");
+    }
+    out.push("|" + hd.join("|") + "|");
+    out.push("|" + sep.join("|") + "|");
+    for (var r = 1; r < rows.length; r++) {
+        var c2 = [];
+        for (var c3 = 0; c3 < rows[r].length; c3++) c2.push(" " + rows[r][c3].v + " ");
+        out.push("|" + c2.join("|") + "|");
+    }
+    return out.join("\n");
+}
+
+function __mpFootnotes(n) {
+    var out = [];
+    var lis = n.getElementsByTagName("li");
+    for (var i = 0; i < lis.length; i++) {
+        var li = lis[i];
+        var idattr = li.getAttribute("id") || "";
+        var m = /^fn-(\d+)$/.exec(idattr);
+        if (!m) continue;
+        var lines = [];
+        var kids = li.childNodes;
+        for (var j = 0; j < kids.length; j++) {
+            var k = kids[j];
+            if (k.nodeType === 3) {
+                var s = __mpPlainTextBlock(k.nodeValue);
+                if (s) lines.push(s);
+                continue;
+            }
+            if (k.nodeType !== 1) continue;
+            var tag = (k.tagName || "").toLowerCase();
+            if (tag === "a") continue;             // footnote backref link
+            if (tag === "p" || tag === "div") {
+                var inner = __mpInline(k, false).replace(/\s+$/g, "");
+                if (inner) lines.push(inner);
+            } else {
+                var b = __mpBlock(k, 0, false);
+                if (b) lines.push(b);
+            }
+        }
+        var one = "[^" + m[1] + "]: ";
+        if (lines.length) one += lines[0];
+        out.push(one);
+        for (var z = 1; z < lines.length; z++) {
+            var sub = lines[z].split("\n");
+            out.push("    " + sub[0]);
+            for (var zz = 1; zz < sub.length; zz++) out.push(sub[zz] === "" ? "" : "    " + sub[zz]);
+        }
+    }
+    return out.join("\n");
+}
+
+function __mpBlock(n, depth, quote) {
+    if (n.nodeType === 3) {
+        return __mpPlainTextBlock(n.nodeValue);
+    }
+    if (n.nodeType !== 1) return "";
+    var tag = (n.tagName || "").toLowerCase();
+    if (tag === "br" || tag === "input") return "";
+    var h = /^h([1-6])$/.exec(tag);
+    if (h) {
+        var hs = "";
+        for (var k = 0; k < parseInt(h[1], 10); k++) hs += "#";
+        return hs + " " + __mpInline(n, false);
+    }
+    if (tag === "p" || tag === "div") return __mpParaText(n);
+    if (tag === "ul" || tag === "ol") return __mpList(n, depth);
+    if (tag === "blockquote") return __mpQuote(n, depth);
+    if (tag === "pre") return __mpCodeBlock(n, depth);
+    if (tag === "table") return __mpTable(n);
+    if (tag === "hr") return "---";
+    return __mpInline(n, false);
+}
+
+function __mpSetMode(on) {
+    var c = document.getElementById("markpeek-content");
+    if (!c) return;
+    document.body.className = on ? "mp-editing" : "";
+    c.contentEditable = on ? "true" : "false";
+    c.oninput = on ? function () { __mpDirty = true; } : null;
+    __mpDirty = false;
+    try { c.focus(); } catch (e) {}
+}
+
+function __mpToMd() {
+    var c = document.getElementById("markpeek-content");
+    var out = "";
+    if (c) {
+        var main = [], defs = [];
+        var kids = c.childNodes;
+        for (var i = 0; i < kids.length; i++) {
+            var k = kids[i];
+            if (k.nodeType === 3) {
+                var s = __mpPlainTextBlock(k.nodeValue);
+                if (s) main.push(s);
+                continue;
+            }
+            if (k.nodeType !== 1) continue;
+            var tag = (k.tagName || "").toLowerCase();
+            if (tag === "section" && k.className && ((" " + k.className + " ").indexOf(" footnotes ") >= 0)) {
+                var d = __mpFootnotes(k);
+                if (d !== "") defs.push(d);
+                continue;
+            }
+            var b = __mpBlock(k, 0, false);
+            if (b !== null && b !== "") main.push(b);
+        }
+        var parts = [];
+        for (var m = 0; m < main.length; m++) if (main[m] !== "") parts.push(main[m]);
+        for (var f = 0; f < defs.length; f++) if (defs[f] !== "") parts.push(defs[f]);
+        out = parts.join("\n\n");
+        if (out !== "" && out.charAt(out.length - 1) !== "\n") out += "\n";
+    }
+    __mpResult = out;
+    return out;
+}
+)JS";
+
+static std::string BuildHtml(const std::string& bodyHtml, const std::wstring& titleW,
+                             const std::wstring& baseDirW) {
     std::string title = EscapeHtml(WideToUtf8(titleW.c_str()));
+    std::string jsBase;
+    if (!baseDirW.empty()) {
+        jsBase = WideToUtf8((L"file:///" + baseDirW).c_str());
+        for (char& c : jsBase) if (c == '\\') c = '/';
+        jsBase = EscapeHtml(jsBase);
+    }
     std::string html;
-    html.reserve(bodyHtml.size() + 4096);
+    html.reserve(bodyHtml.size() + 8192);
     html += "<!DOCTYPE html>\n<html>\n<head>\n<meta charset=\"utf-8\">\n";
     html += "<meta http-equiv=\"X-UA-Compatible\" content=\"IE=edge\">\n";
     html += "<title>" + title + "</title>\n<style>\n";
     html += kCss;
-    html += "\n</style>\n</head>\n<body>\n<div id=\"markpeek-content\">\n";
+    html += "\n</style>\n<script>\n";
+    html += kEditorJs;
+    html += "\nvar __mpBase = \"";
+    html += jsBase;
+    html += "\";\n</script>\n</head>\n<body>\n<div id=\"markpeek-content\">\n";
     html += bodyHtml;
     html += "\n</div>\n</body>\n</html>\n";
     return html;
 }
 
 // ---------------------------------------------------------------------------
-// WebBrowser control
+// WebBrowser control + JS bridge
 
 static void ShowHtml(const std::string& html) {
     if (!g_wb) return;
@@ -249,68 +687,98 @@ static void ShowHtml(const std::string& html) {
     VariantClear(&vUrl);
 }
 
+static IHTMLDocument2* GetDoc() {
+    if (!g_wb) return NULL;
+    IDispatch* disp = NULL;
+    if (FAILED(g_wb->get_Document(&disp)) || !disp) return NULL;
+    IHTMLDocument2* d2 = NULL;
+    disp->QueryInterface(IID_IHTMLDocument2, (void**)&d2);
+    disp->Release();
+    return d2;
+}
+
+static IHTMLWindow2* GetWin() {
+    IHTMLDocument2* d = GetDoc();
+    if (!d) return NULL;
+    IHTMLWindow2* w = NULL;
+    d->get_parentWindow(&w);
+    d->Release();
+    return w;
+}
+
+// Run a snippet of JavaScript in the page. Returns false if the page isn't ready.
+static bool JsEval(const wchar_t* code) {
+    IHTMLWindow2* w = GetWin();
+    if (!w) return false;
+    BSTR b = SysAllocString(code);
+    BSTR lang = SysAllocString(L"javascript");
+    VARIANT ret;
+    VariantInit(&ret);
+    HRESULT hr = w->execScript(b, lang, &ret);
+    SysFreeString(b);
+    SysFreeString(lang);
+    VariantClear(&ret);
+    w->Release();
+    return SUCCEEDED(hr);
+}
+
+static IDispatch* GetWinDisp() {
+    IHTMLWindow2* w = GetWin();
+    if (!w) return NULL;
+    IDispatch* d = NULL;
+    w->QueryInterface(IID_IDispatch, (void**)&d);
+    w->Release();
+    return d;
+}
+
+// Reads a boolean/string script variable. Returns false if not found.
+static bool JsReadVar(const wchar_t* name, bool* outBool, std::wstring* outStr) {
+    IDispatch* d = GetWinDisp();
+    if (!d) return false;
+    bool ok = false;
+    BSTR nb = SysAllocString(name);
+    OLECHAR* pNames[1] = { nb };
+    DISPID id;
+    if (SUCCEEDED(d->GetIDsOfNames(kNullIid, pNames, 1, LOCALE_USER_DEFAULT, &id))) {
+        VARIANT res;
+        VariantInit(&res);
+        if (SUCCEEDED(d->Invoke(id, kNullIid, LOCALE_USER_DEFAULT, DISPATCH_PROPERTYGET,
+                                NULL, &res, NULL, NULL))) {
+            if (outBool && res.vt == VT_BOOL) { *outBool = (res.boolVal != VARIANT_FALSE); ok = true; }
+            else if (outBool && res.vt == VT_I4) { *outBool = (res.lVal != 0); ok = true; }
+            else if (outBool && res.vt == VT_BSTR) { *outBool = _wcsicmp(res.bstrVal, L"true") == 0; ok = true; }
+            else if (outStr && res.vt == VT_BSTR && res.bstrVal) { *outStr = res.bstrVal; ok = true; }
+            VariantClear(&res);
+        }
+    }
+    SysFreeString(nb);
+    d->Release();
+    return ok;
+}
+
+// Calls the JS serializer and returns the resulting Markdown (also read back
+// from __mpResult as a fallback).
+static bool JsSerializeMarkdown(std::wstring& outMd) {
+    if (!JsEval(L"__mpToMd();")) return false;
+    bool has = false;
+    std::wstring v;
+    if (JsReadVar(L"__mpResult", NULL, &v)) { outMd = v; has = true; }
+    if (has && !outMd.empty()) return true;
+    // fallback: try to read the returned value through a property read of __mpResult2
+    if (!has) outMd = L"";
+    return has;
+}
+
+static bool JsGetDirty() {
+    bool b = false;
+    if (JsReadVar(L"__mpDirty", &b, NULL)) return b;
+    return false;
+}
+
 static void SetStatus(const std::wstring& text) {
     if (g_hwndStatus)
         SendMessageW(g_hwndStatus, SB_SETTEXT, 0, (LPARAM)text.c_str());
 }
-
-static bool PromptSaveIfDirty();
-static void LeaveEditMode(bool save, bool rerender);
-
-static void OpenFile(const std::wstring& path) {
-    if (g_editing) {
-        if (!PromptSaveIfDirty()) return;
-        LeaveEditMode(false, false);
-    }
-    if (!FileExists(path)) {
-        std::wstring msg = L"File not found:\n" + path;
-        MessageBoxW(g_hwnd, msg.c_str(), APP_NAME, MB_OK | MB_ICONWARNING);
-        return;
-    }
-    std::string md = ReadFileUtf8(path);
-    std::string body;
-    if (!MdToHtml(md, body)) body = "<p><em>(render error)</em></p>";
-    AbsolutizeImageSrcs(body, DirOf(path));
-
-    std::wstring name = BaseName(path);
-    std::string html = BuildHtml(body, name);
-    ShowHtml(html);
-    g_currentPath = path;
-
-    SetWindowTextW(g_hwnd, (name + L" - " + APP_NAME).c_str());
-
-    int lines = 0;
-    for (char c : md) if (c == '\n') lines++;
-    wchar_t st[2600];
-    swprintf(st, 2600, L"%s   |   %d lines", path.c_str(), lines);
-    SetStatus(st);
-}
-
-static void ShowWelcome() {
-    const wchar_t* welcome =
-        L"# Welcome to MarkPeek\n\n"
-        L"A minimal, Typora-style Markdown viewer for Windows.\n\n"
-        L"## Get started\n\n"
-        L"- Press **Ctrl+O** or drag & drop a `.md` file into this window\n"
-        L"- Press **F5** to reload, **Ctrl+E** to edit, **Ctrl+S** to save\n"
-        L"- Right-click a `.md` file in Explorer -> **Open with** -> MarkPeek\n\n"
-        L"## Features\n\n"
-        L"- Clean, Typora-like design\n"
-        L"- CommonMark + GitHub tables, task lists, strikethrough\n"
-        L"- UTF-8 / UTF-16 files\n"
-        L"- Portable: no installation, no dependencies\n\n"
-        L"> Tip: use *File -> Set as default viewer for .md* to open `.md` files from Explorer.";
-    std::string md = WideToUtf8(welcome);
-    std::string body;
-    MdToHtml(md, body);
-    std::string html = BuildHtml(body, L"Welcome");
-    ShowHtml(html);
-    SetWindowTextW(g_hwnd, (std::wstring(APP_NAME) + L" - drop or open a Markdown file").c_str());
-    SetStatus(L"Ready - open a .md file (Ctrl+O) or drop it here");
-}
-
-// ---------------------------------------------------------------------------
-// Edit mode (built-in editor)
 
 static void UpdateTitle() {
     if (g_currentPath.empty()) return;
@@ -320,12 +788,26 @@ static void UpdateTitle() {
     SetWindowTextW(g_hwnd, t.c_str());
 }
 
+// ---------------------------------------------------------------------------
+// Edit mode (WYSIWYG, same rendered document)
+
+static bool PromptSaveIfDirty();
+static void EnterEditMode();
+static void LeaveEditMode();
+
 static bool SaveCurrentFile() {
-    if (!g_hwndEdit || g_currentPath.empty()) return false;
-    int len = GetWindowTextLengthW(g_hwndEdit);
-    std::wstring text(len, L'\0');
-    GetWindowTextW(g_hwndEdit, &text[0], len + 1);
-    std::string utf8 = WideToUtf8(text.c_str(), len);
+    if (g_currentPath.empty()) return false;
+    std::wstring mdW;
+    if (!g_editing) {   // Ctrl+S in preview: fall back to source read? we require edit mode
+        // try edit mode first
+        return false;
+    }
+    if (!JsSerializeMarkdown(mdW)) {
+        MessageBoxW(g_hwnd, L"Could not convert the edited document back to Markdown.",
+                    APP_NAME, MB_OK | MB_ICONERROR);
+        return false;
+    }
+    std::string utf8 = WideToUtf8(mdW.c_str(), (int)mdW.size());
     std::ofstream out(g_currentPath.c_str(), std::ios::binary | std::ios::trunc);
     if (!out) {
         MessageBoxW(g_hwnd, (L"Could not write file:\n" + g_currentPath).c_str(),
@@ -349,36 +831,85 @@ static bool PromptSaveIfDirty() {
 }
 
 static void EnterEditMode() {
-    if (g_editing || !g_hwndEdit) return;
+    if (g_editing) return;
     if (g_currentPath.empty()) {
         SendMessageW(g_hwnd, WM_COMMAND, IDM_OPEN, 0);
         if (g_currentPath.empty()) return;
     }
-    std::string md = ReadFileUtf8(g_currentPath);
-    SetWindowTextW(g_hwndEdit, Utf8ToWide(md).c_str());
-    if (g_hwndBrowser) ShowWindow(g_hwndBrowser, SW_HIDE);
-    if (g_wb) g_wb->put_Visible(FALSE);
-    ShowWindow(g_hwndEdit, SW_SHOW);
-    SetFocus(g_hwndEdit);
-    SendMessageW(g_hwndEdit, EM_SETSEL, 0, 0);
+    if (!JsEval(L"__mpSetMode(true);")) {
+        SetStatus(L"Document not ready yet - try again in a moment");
+        return;
+    }
     g_editing = true;
     g_dirty = false;
+    if (!g_dirtyTimer) g_dirtyTimer = SetTimer(g_hwnd, DIRTY_TIMER_ID, DIRTY_POLL_MS, NULL);
     UpdateTitle();
-    SetStatus(L"Editing - Ctrl+S to save, Ctrl+E to preview");
+    SetStatus(L"Editing - Ctrl+S to save, Ctrl+E to preview (WYSIWYG)");
 }
 
-static void LeaveEditMode(bool save, bool rerender) {
+static void LeaveEditMode() {
     if (!g_editing) return;
-    if (save && g_dirty) SaveCurrentFile();
-    ShowWindow(g_hwndEdit, SW_HIDE);
-    if (g_hwndBrowser) ShowWindow(g_hwndBrowser, SW_SHOW);
-    if (g_wb) g_wb->put_Visible(TRUE);
+    JsEval(L"__mpSetMode(false);");
     g_editing = false;
+    if (g_dirtyTimer) {
+        KillTimer(g_hwnd, g_dirtyTimer);
+        g_dirtyTimer = 0;
+    }
     UpdateTitle();
-    if (rerender && !g_currentPath.empty())
-        OpenFile(g_currentPath);
-    else if (g_hwndBrowser)
-        SetFocus(g_hwndBrowser);
+    SetStatus(L"Preview - Ctrl+E to edit, Ctrl+S to save");
+}
+
+static void OpenFile(const std::wstring& path) {
+    if (g_editing) LeaveEditMode();       // keep the document; we navigate anyway
+    if (!FileExists(path)) {
+        std::wstring msg = L"File not found:\n" + path;
+        MessageBoxW(g_hwnd, msg.c_str(), APP_NAME, MB_OK | MB_ICONWARNING);
+        return;
+    }
+    std::string md = ReadFileUtf8(path);
+    std::string body;
+    if (!MdToHtml(md, body)) body = "<p><em>(render error)</em></p>";
+    AbsolutizeImageSrcs(body, DirOf(path));
+
+    std::wstring name = BaseName(path);
+    std::string html = BuildHtml(body, name, DirOf(path));
+    ShowHtml(html);
+    g_currentPath = path;
+    g_dirty = false;
+    UpdateTitle();
+
+    int lines = 0;
+    for (char c : md) if (c == '\n') lines++;
+    wchar_t st[2600];
+    swprintf(st, 2600, L"%s   |   %d lines", path.c_str(), lines);
+    SetStatus(st);
+}
+
+static void ShowWelcome() {
+    const wchar_t* welcome =
+        L"# Welcome to MarkPeek\n\n"
+        L"A minimal, Typora-style Markdown viewer & editor for Windows.\n\n"
+        L"## Get started\n\n"
+        L"- Press **Ctrl+O** or drag & drop a `.md` file into this window\n"
+        L"- Press **Ctrl+E** to edit right in the rendered view (WYSIWYG)\n"
+        L"- While editing, **Ctrl+S** saves; **Ctrl+A**, **Ctrl+C/V/X/Z** and other\n"
+        L"  shortcuts work in any keyboard layout\n"
+        L"- Right-click a `.md` file in Explorer -> **Open with** -> MarkPeek\n\n"
+        L"## Features\n\n"
+        L"- Clean, Typora-like design\n"
+        L"- CommonMark + GitHub tables, task lists, strikethrough\n"
+        L"- UTF-8 / UTF-16 files\n"
+        L"- Portable: no installation, no dependencies\n\n"
+        L"> Tip: use *File -> Set as default viewer for .md* to open `.md` files from Explorer.";
+    std::string md = WideToUtf8(welcome);
+    std::string body;
+    MdToHtml(md, body);
+    std::string html = BuildHtml(body, L"Welcome", L"");
+    ShowHtml(html);
+    g_currentPath.clear();
+    g_dirty = false;
+    SetWindowTextW(g_hwnd, (std::wstring(APP_NAME) + L" - drop or open a Markdown file").c_str());
+    SetStatus(L"Ready - open a .md file (Ctrl+O) or drop it here");
 }
 
 // ---------------------------------------------------------------------------
@@ -450,11 +981,8 @@ static void SetAssociation(bool on) {
 }
 
 // ---------------------------------------------------------------------------
-// Window
-
-// ---------------------------------------------------------------------------
 // WebBrowser control host (IOleClientSite / IOleInPlaceSite / IOleInPlaceFrame
-// / IOleControlSite / IDocHostUIHandler) — classic EXEBrowser pattern.
+// / IOleControlSite) — classic EXEBrowser pattern.
 
 class BrowserSite : public IOleClientSite, public IOleInPlaceSite,
                     public IOleInPlaceFrame, public IOleControlSite {
@@ -577,15 +1105,6 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
                                            L"", hwnd, IDC_STATUS);
         DragAcceptFiles(hwnd, TRUE);
         CreateBrowser(hwnd);
-        g_hwndEdit = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"",
-            WS_CHILD | ES_MULTILINE | ES_AUTOVSCROLL | ES_AUTOHSCROLL |
-            WS_VSCROLL | WS_HSCROLL | ES_WANTRETURN,
-            0, 0, 0, 0, hwnd, (HMENU)IDC_EDIT, GetModuleHandleW(NULL), NULL);
-        g_hEditFont = CreateFontW(-15, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
-            ANSI_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
-            CLEARTYPE_QUALITY, FIXED_PITCH, L"Consolas");
-        if (g_hwndEdit && g_hEditFont)
-            SendMessageW(g_hwndEdit, WM_SETFONT, (WPARAM)g_hEditFont, TRUE);
         return 0;
 
     case WM_SIZE:
@@ -593,41 +1112,45 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
             RECT rc;
             GetClientRect(hwnd, &rc);
             if (g_hwndStatus) {
-                // Standard MSDN pattern: the status bar must receive WM_SIZE
-                // itself to resize to the parent's full width and re-stick to
-                // the bottom. Without this it keeps its creation-time
-                // position, which ends up in the middle of the screen over
-                // the rendered text when the window is maximized/fullscreen.
                 SendMessageW(g_hwndStatus, WM_SIZE, 0, 0);
                 RECT sr;
                 GetWindowRect(g_hwndStatus, &sr);
                 rc.bottom -= (sr.bottom - sr.top);
             }
             SetWindowPos(g_hwndBrowser, NULL, 0, 0, rc.right, rc.bottom, SWP_NOZORDER);
-            if (g_hwndEdit)
-                SetWindowPos(g_hwndEdit, NULL, 0, 0, rc.right, rc.bottom, SWP_NOZORDER);
+        }
+        return 0;
+
+    case WM_TIMER:
+        if (wParam == DIRTY_TIMER_ID && g_editing) {
+            if (JsGetDirty()) {
+                g_dirty = true;
+                UpdateTitle();
+                JsEval(L"__mpDirty = false;");
+            }
         }
         return 0;
 
     case WM_DROPFILES: {
         HDROP hDrop = (HDROP)wParam;
         wchar_t buf[MAX_PATH];
-        if (DragQueryFileW(hDrop, 0, buf, MAX_PATH) > 0)
+        if (DragQueryFileW(hDrop, 0, buf, MAX_PATH) > 0) {
+            if (g_editing && !PromptSaveIfDirty()) break;
             OpenFile(buf);
+        }
         DragFinish(hDrop);
         return 0;
     }
 
+    case WM_CLOSE:
+        if (g_editing && !PromptSaveIfDirty()) return 0;   // cancelled
+        DestroyWindow(hwnd);
+        return 0;
+
     case WM_COMMAND:
-        if (LOWORD(wParam) == IDC_EDIT && HIWORD(wParam) == EN_UPDATE) {
-            if (g_editing && !g_dirty) {
-                g_dirty = true;
-                UpdateTitle();
-            }
-            return 0;
-        }
         switch (LOWORD(wParam)) {
         case IDM_OPEN: {
+            if (g_editing && !PromptSaveIfDirty()) return 0;
             wchar_t file[MAX_PATH] = {0};
             OPENFILENAMEW ofn;
             ZeroMemory(&ofn, sizeof(ofn));
@@ -639,27 +1162,29 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
             ofn.lpstrFile = file;
             ofn.nMaxFile = MAX_PATH;
             ofn.Flags = OFN_FILEMUSTEXIST | OFN_HIDEREADONLY;
-            if (GetOpenFileNameW(&ofn))
+            if (GetOpenFileNameW(&ofn)) {
+                LeaveEditMode();
                 OpenFile(file);
+            }
             return 0;
         }
         case IDM_RELOAD:
-            if (!g_currentPath.empty())
-                OpenFile(g_currentPath);
+            if (g_editing && !PromptSaveIfDirty()) return 0;
+            if (!g_currentPath.empty()) OpenFile(g_currentPath);
             return 0;
         case IDM_EDIT:
             if (g_editing) {
-                if (PromptSaveIfDirty())
-                    LeaveEditMode(false, true);
+                if (!PromptSaveIfDirty()) return 0;      // cancelled
+                bool wasDirty = g_dirty;                 // still dirty if user chose No
+                LeaveEditMode();
+                if (wasDirty && !g_currentPath.empty()) OpenFile(g_currentPath);
             } else {
                 EnterEditMode();
             }
             return 0;
         case IDM_SAVE:
-            if (g_editing)
-                SaveCurrentFile();
-            else
-                EnterEditMode();
+            if (g_editing) SaveCurrentFile();
+            else { EnterEditMode(); SaveCurrentFile(); }
             return 0;
         case IDM_ASSOC:
             SetAssociation(true);
@@ -673,7 +1198,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
         case IDM_ABOUT:
             MessageBoxW(hwnd,
                 L"MarkPeek " APP_VERSION L"\n"
-                L"A minimal Typora-style Markdown viewer.\n\n"
+                L"A minimal Typora-style Markdown viewer & editor.\n\n"
                 L"Rendered with md4c + embedded IE (MSHTML).\n"
                 L"MIT License. Windows 7 / 10, portable.",
                 APP_NAME, MB_OK | MB_ICONINFORMATION);
@@ -695,9 +1220,9 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
             g_site->Release();
             g_site = NULL;
         }
-        if (g_hEditFont) {
-            DeleteObject(g_hEditFont);
-            g_hEditFont = NULL;
+        if (g_dirtyTimer) {
+            KillTimer(hwnd, g_dirtyTimer);
+            g_dirtyTimer = 0;
         }
         if (!g_tempHtmlPath.empty()) {
             DeleteFileW(g_tempHtmlPath.c_str());

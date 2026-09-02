@@ -1,6 +1,6 @@
 # MarkPeek
 
-A minimal, **Typora-style Markdown viewer** for Windows.
+A minimal, **Typora-style Markdown viewer & editor** for Windows.
 
 Clean rendering, zero dependencies, one portable `.exe`. Built for **Windows 7 SP1** and **Windows 10** (32-bit binary, runs on x86 and x64).
 
@@ -9,13 +9,14 @@ Clean rendering, zero dependencies, one portable `.exe`. Built for **Windows 7 S
 ## Features
 
 - Typora-like clean design (centered content, GitHub-style typography)
-- CommonMark + GitHub extensions: tables, task lists, strikethrough, footnotes, admonitions
+- **WYSIWYG editing**: press **Ctrl+E** and edit the rendered document directly — headings, tables and lists are edited in place, exactly as they will look in the preview, then **Ctrl+S** saves it back to Markdown
+- Editing hotkeys (**Ctrl+A / Ctrl+C / Ctrl+X / Ctrl+V / Ctrl+Z / Ctrl+Y**, undo, etc.) are handled natively by the browser engine, so they work in **any keyboard layout** (RU/EN)
+- Unsaved changes are marked with `*` in the title bar and a save prompt protects you on exit
+- CommonMark + GitHub extensions: tables, task lists, strikethrough, footnotes
 - UTF-8 / UTF-16LE / UTF-16BE files
 - Relative images next to the `.md` file are resolved automatically
 - Drag & drop a file onto the window, or open from the command line: `MarkPeek.exe readme.md`
-- `Ctrl+O` open, `F5` reload, `Ctrl+E` edit source, `Ctrl+S` save (UTF-8)
-- Built-in editor: press **Ctrl+E** to switch between preview and editing, **Ctrl+S** saves the file; unsaved changes are marked with `*` in the title bar and a save prompt protects you on exit
-- Hotkeys work in any keyboard layout (RU/EN)
+- `Ctrl+O` open, `F5` reload, `Ctrl+E` edit / preview, `Ctrl+S` save (UTF-8)
 - Optional: set MarkPeek as the default viewer for `.md` files (per-user, no admin) — the file icon comes with it
 - Portable: no installer, no runtime dependencies, no registry writes except the optional file association
 
@@ -47,13 +48,13 @@ g++ main.o md4c.o md4c-html.o entity.o appres.o -o MarkPeek.exe \
     -mwindows -static -lole32 -loleaut32 -luuid -lcomctl32 -lshlwapi
 ```
 
-The result is `dist\MarkPeek.exe` — a single portable file.
+`build.bat` looks for the compiler in `C:\PORTABLE\mingw32` and falls back to a `mingw32` folder next to the project. The result is `dist\MarkPeek.exe` — a single portable file.
 
 ## How it works
 
 - **md4c** ([mity/md4c](https://github.com/mity/md4c), MIT) converts Markdown to HTML.
 - The HTML is rendered in an embedded **Internet Explorer (MSHTML)** control — present on every Windows 7/10 system, so the app needs no bundled browser engine.
-- Editing uses a native Win32 edit control (Consolas, UTF-8); `Ctrl+C`/`Ctrl+A` in the preview go through the browser engine natively.
+- Editing is **WYSIWYG**: the same rendered document is switched to `contenteditable`, so you edit what you see. On save a small script inside the page serialises the edited DOM back to Markdown (it understands the exact HTML that md4c emits for headings, paragraphs, lists, task lists, tables with alignment, block quotes, code fences, links, images and footnotes).
 - A Typora-like theme is applied via embedded CSS (IE9-compatible).
 
 ## Project layout
@@ -67,7 +68,8 @@ MarkPeek/
 │   ├── app.rc         icon + version info
 │   └── md4c/          third-party Markdown parser (MIT, vendored)
 ├── assets/
-│   ├── icon.png       app icon (generated with image.pollinations.ai)
+│   ├── icon.svg       app icon source (hand-drawn vector)
+│   ├── icon.png       app icon (rendered from icon.svg)
 │   ├── icon.ico       multi-size ICO (16..256 px)
 │   └── screenshot.png
 └── dist/
