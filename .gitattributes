@@ -1,0 +1,12 @@
+# Keep scripts and build files LF everywhere (CRLF breaks bash on Linux).
+*.sh   text eol=lf
+*.yml  text eol=lf
+*.yaml text eol=lf
+Makefile text eol=lf
+*.py   text eol=lf
+*.cpp  text
+*.h    text
+*.c    text
+*.rc   text
+*.md   text
+*.desktop text eol=lf

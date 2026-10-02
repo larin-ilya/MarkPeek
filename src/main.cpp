@@ -39,7 +39,7 @@
 #include "resource.h"
 
 #define APP_NAME L"MarkPeek"
-#define APP_VERSION L"1.2.0"
+#define APP_VERSION L"1.3.0"
 
 static HWND g_hwnd = NULL;
 static HWND g_hwndBrowser = NULL;
