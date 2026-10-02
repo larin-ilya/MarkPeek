@@ -59,9 +59,19 @@ export MP_SMOKE_JS="$TMP/check.js"
 export MP_SMOKE_OUT="$TMP/result.json"
 export MP_SMOKE_FILE="$(pwd)/$SAMPLE"
 
+# WebKit2GTK in containers: disable bubblewrap sandbox and DMABUF renderer
+# (no user namespaces / no GPU in CI); force software rendering via Xvfb.
+export WEBKIT_DISABLE_SANDBOX_THIS_IS_DANGEROUS=1
+export WEBKIT_DISABLE_DMABUF_RENDERER=1
+export LIBGL_ALWAYS_SOFTWARE=1
+export GDK_BACKEND=x11
+
 xvfb-run -a -s "-screen 0 1280x800x24" "$BIN" "$MP_SMOKE_FILE" >"$TMP/app.log" 2>&1
 RC=$?
+SMOKE_OUT_CONTENT=""
+if [ -f "$TMP/result.json" ]; then SMOKE_OUT_CONTENT="$(cat "$TMP/result.json")"; fi
 unset MP_SMOKE_JS MP_SMOKE_OUT MP_SMOKE_FILE
+unset WEBKIT_DISABLE_SANDBOX_THIS_IS_DANGEROUS WEBKIT_DISABLE_DMABUF_RENDERER LIBGL_ALWAYS_SOFTWARE GDK_BACKEND
 
 echo "--- app log (first 20 lines) ---"
 head -20 "$TMP/app.log"
@@ -71,13 +81,15 @@ if [ $RC -ne 0 ]; then
   exit $RC
 fi
 
-if [ ! -f "$MP_SMOKE_OUT" ]; then
+if [ -z "$SMOKE_OUT_CONTENT" ]; then
   echo "FAIL: no smoke result produced (is MP_SMOKE_JS supported?)" >&2
   exit 3
 fi
 
+MP_SMOKE_OUT="$TMP/result.json"
+
 echo "--- result ---"
-cat "$MP_SMOKE_OUT"
+printf '%s\n' "$SMOKE_OUT_CONTENT"
 echo
 
 PASS=1

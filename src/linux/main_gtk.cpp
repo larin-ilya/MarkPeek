@@ -408,7 +408,9 @@ static void RunJs(const std::string& code, const char* task, const std::string& 
 static gboolean SmokeStart(gpointer) {
     static int tries = 0;
     if (++tries > 60) {  // ~30 s without a rendered page
-        g_warning("smoke test: page never became ready");
+        g_warning("smoke test: page never became ready (uri=%s, title=%s)",
+                webkit_web_view_get_uri(WEBKIT_WEB_VIEW(g_webview)) ? webkit_web_view_get_uri(WEBKIT_WEB_VIEW(g_webview)) : "(null)",
+                webkit_web_view_get_title(WEBKIT_WEB_VIEW(g_webview)) ? webkit_web_view_get_title(WEBKIT_WEB_VIEW(g_webview)) : "(null)");
         gtk_main_quit();
         return G_SOURCE_REMOVE;
     }
@@ -535,7 +537,7 @@ static void OpenFile(const std::string& path) {
     EmbedLocalImages(body, dir);
 
     std::string html = BuildHtml(body, BaseName(path), dir);
-    webkit_web_view_load_html(WEBKIT_WEB_VIEW(g_webview), html.c_str(), "about:markpeek");
+    webkit_web_view_load_html(WEBKIT_WEB_VIEW(g_webview), html.c_str(), "about:blank");
     g_currentPath = path;
     g_dirty = false;
     UpdateTitle();
@@ -564,7 +566,7 @@ static void ShowWelcome() {
     std::string body;
     MdToHtml(welcome, body);
     std::string html = BuildHtml(body, "Welcome", "");
-    webkit_web_view_load_html(WEBKIT_WEB_VIEW(g_webview), html.c_str(), "about:markpeek");
+    webkit_web_view_load_html(WEBKIT_WEB_VIEW(g_webview), html.c_str(), "about:blank");
     g_currentPath.clear();
     g_dirty = false;
     UpdateTitle();
@@ -690,6 +692,7 @@ static void Activate(GtkApplication* app, gpointer) {
     g_webview = webkit_web_view_new();
     WebKitSettings* settings = webkit_web_view_get_settings(WEBKIT_WEB_VIEW(g_webview));
     webkit_settings_set_javascript_can_access_clipboard(settings, TRUE);
+    webkit_settings_set_enable_write_console_messages_to_stdout(settings, TRUE);
     webkit_settings_set_enable_tabs_to_links(settings, FALSE);
     g_signal_connect(g_webview, "decide-policy", G_CALLBACK(OnDecidePolicy), NULL);
 
