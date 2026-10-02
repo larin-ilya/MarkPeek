@@ -18,6 +18,8 @@
 #include <string>
 #include <vector>
 
+#include "md4c/md4c.h"
+#include "md4c/md4c-html.h"
 #include "shared/shared_css.h"
 #include "shared/editor_js.h"
 
@@ -57,7 +59,7 @@ static void SetStatus(const std::string& text) {
     if (!g_status) return;
     GtkStatusbar* sb = GTK_STATUSBAR(g_status);
     static guint ctx = gtk_statusbar_get_context_id(sb, "markpeek-status");
-    gtk_statusbar_remove_all(sb, ctx, 0);
+    gtk_statusbar_pop(sb, ctx);
     gtk_statusbar_push(sb, ctx, text.c_str());
 }
 
@@ -313,10 +315,13 @@ struct JsCtx {
     std::string sourcePath;  // used by "save"
 };
 
+static void RunJs(const std::string& code, const char* task, const std::string& sourcePath);
+
 static void OnJsFinished(WebKitWebView*, GAsyncResult* res, gpointer userdata) {
     JsCtx* ctx = (JsCtx*)userdata;
     GError* err = NULL;
-    WebKitJavascriptResult* jr = webkit_web_view_run_javascript_finish(g_webview, res, &err);
+    WebKitJavascriptResult* jr = webkit_web_view_run_javascript_finish(
+        WEBKIT_WEB_VIEW(g_webview), res, &err);
 
     if (err || !jr) {
         if (ctx->task != "check-dirty")
@@ -743,8 +748,8 @@ int main(int argc, char** argv) {
     }
 
     GtkApplication* app = gtk_application_new("io.github.larin_ilya.MarkPeek",
-                                              G_APPLICATION_NON_UNIQUE |
-                                              G_APPLICATION_HANDLES_OPEN);
+                                              (GApplicationFlags)(G_APPLICATION_NON_UNIQUE |
+                                              G_APPLICATION_HANDLES_OPEN));
     g_signal_connect(app, "activate", G_CALLBACK(Activate), NULL);
     g_signal_connect(app, "open", G_CALLBACK(OnAppOpen), NULL);
     int rc = g_application_run(G_APPLICATION(app), argc, argv);
