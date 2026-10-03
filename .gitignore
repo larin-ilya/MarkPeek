@@ -5,3 +5,5 @@ Thumbs.dbAppDir/
 pack/
 *.AppImage
 linuxdeploy
+MarkPeek-*.AppImage
+*.o
