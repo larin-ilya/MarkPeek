@@ -1,4 +1,7 @@
 dist/
 *.o
 *.exe
-Thumbs.db
+Thumbs.dbAppDir/
+pack/
+*.AppImage
+linuxdeploy
