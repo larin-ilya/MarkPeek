@@ -85,6 +85,8 @@ jobs:
       - name: Build AppImage
         run: |
           TAG="${GITHUB_REF_NAME}"
+          mkdir -p dist
+          rm -f MarkPeek-*.AppImage
           curl -sSfL -o linuxdeploy https://github.com/linuxdeploy/linuxdeploy/releases/download/continuous/linuxdeploy-x86_64.AppImage
           chmod +x linuxdeploy
           mkdir -p AppDir/usr/bin AppDir/usr/share/applications AppDir/usr/share/icons/hicolor/256x256/apps
