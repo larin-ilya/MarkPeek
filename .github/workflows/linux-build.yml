@@ -43,7 +43,7 @@ jobs:
           file dist/markpeek
           ldd dist/markpeek | head -30
 
-      - name: Smoke test (offscreen render + DOM/JS roundtrip)
+      - name: Smoke test (offscreen render + DOM/JS roundtrip + encodings)
         run: |
           sudo apt-get install -y --no-install-recommends xvfb
           xvfb-run -a -s "-screen 0 1280x800x24" ./ci/smoke_test.sh dist/markpeek
@@ -101,6 +101,12 @@ jobs:
           sha256sum "dist/${APPIMG}" > "dist/${APPIMG}.sha256"
           echo "APPIMAGE=dist/${APPIMG}" >> "$GITHUB_ENV"
           echo "APPIMAGE_SUM=dist/${APPIMG}.sha256" >> "$GITHUB_ENV"
+
+      - name: Smoke test the AppImage itself (release artifact, not just the raw binary)
+        run: |
+          export APPIMAGE_EXTRACT_AND_RUN=1
+          APPIMG="$(ls dist/*.AppImage | head -n1)"
+          xvfb-run -a -s "-screen 0 1280x800x24" ./ci/smoke_test.sh "$APPIMG"
 
       - name: Upload build artifacts
         uses: actions/upload-artifact@v4

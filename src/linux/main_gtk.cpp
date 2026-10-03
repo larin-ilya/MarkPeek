@@ -14,6 +14,7 @@
 #include <jsc/jsc.h>
 
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <string>
 #include <vector>
@@ -24,7 +25,7 @@
 #include "shared/editor_js.h"
 
 #define APP_NAME "MarkPeek"
-#define APP_VERSION "1.3.0"
+#define APP_VERSION "1.3.1"
 
 // Optional self-test hook (used by ci/smoke_test.sh): when MP_SMOKE_JS is set
 // the app evaluates that JS after the requested file renders and writes the
@@ -39,6 +40,10 @@ static GtkWidget* g_btn_edit = NULL;
 static std::string g_currentPath;
 static bool g_editing = false;
 static bool g_dirty = false;
+// Files passed on the command line are opened from an idle callback: webkit_web_view_load_html()
+// issued directly inside the GApplication "open" handler can race the main loop startup (seen with
+// WebKitGTK 2.5x: the web process never spawns and the page stays empty). Deferring fixes it.
+static std::vector<std::string> g_pendingOpenFiles;
 
 // ---------------------------------------------------------------------------
 // Small helpers
@@ -63,15 +68,51 @@ static void SetStatus(const std::string& text) {
     gtk_statusbar_push(sb, ctx, text.c_str());
 }
 
+// Icon-theme helper: in minimal/container environments (WSL1, some CI images)
+// gdk-pixbuf cannot decode theme icons (no memfd_create in the kernel) and GTK
+// aborts on any image widget render. Probe-load each icon ONCE; only attach an
+// image widget when the theme can actually decode it, else fall back to text.
+static bool IconThemeCanLoad(const char* name) {
+    GtkIconTheme* theme = gtk_icon_theme_get_default();
+    if (!theme) return false;
+    GError* err = NULL;
+    GdkPixbuf* pb = gtk_icon_theme_load_icon(theme, name, 16,
+                                             GTK_ICON_LOOKUP_USE_BUILTIN, &err);
+    if (err) {
+        g_error_free(err);
+        // gtk_icon_theme_load_icon() with an error may have already scheduled a
+        // g_error abort inside GTK on broken platforms - it does not: the abort
+        // happens at RENDER time of a failed GdkPixbuf, not at load. Safe.
+        return false;
+    }
+    if (pb) { g_object_unref(pb); return true; }
+    return false;
+}
+
+#define IconThemeHas IconThemeCanLoad
+
+static GtkWidget* MakeIconButton(const char* icon_name, const char* label) {
+    if (IconThemeHas(icon_name))
+        return gtk_button_new_from_icon_name(icon_name, GTK_ICON_SIZE_MENU);
+    return gtk_button_new_with_mnemonic(label);
+}
+
 static void UpdateEditButton() {
     if (!g_btn_edit) return;
     gtk_button_set_label(GTK_BUTTON(g_btn_edit), g_editing ? "Preview" : "Edit");
-    gtk_button_set_image(GTK_BUTTON(g_btn_edit),
-                         gtk_image_new_from_icon_name(g_editing ? "view-paged-symbolic"
-                                                                : "document-edit-symbolic",
-                                                      GTK_ICON_SIZE_MENU));
+    const char* icon = g_editing ? "view-paged-symbolic" : "document-edit-symbolic";
+    if (IconThemeHas(icon))
+        gtk_button_set_image(GTK_BUTTON(g_btn_edit),
+                             gtk_image_new_from_icon_name(icon, GTK_ICON_SIZE_MENU));
+    else
+        gtk_button_set_image(GTK_BUTTON(g_btn_edit), NULL);
 }
 
+
+// Icon-theme helper: in minimal/container environments (WSL1, some CI images)
+// gdk-pixbuf cannot decode SVG theme icons (no memfd_create) and GTK aborts.
+// Only use named icons when the theme can actually load them; fall back to a
+// plain text button so the app stays alive everywhere.
 static bool FileExists(const std::string& p) {
     return g_file_test(p.c_str(), G_FILE_TEST_EXISTS) &&
            !g_file_test(p.c_str(), G_FILE_TEST_IS_DIR);
@@ -111,7 +152,49 @@ static std::string EscapeHtml(const std::string& s) {
     return out;
 }
 
-// Reads a file as UTF-8 (handles UTF-8 / UTF-16LE / UTF-16BE BOMs).
+// Heuristic detection of BOM-less Windows-1251 (Cyrillic ANSI) text:
+// valid UTF-8 would not contain 0xC0-0xFF followed by invalid continuation
+// bytes. Counts bytes that form invalid UTF-8 sequences in the Cyrillic
+// uppercase/lowercase CP1251 range and checks a marker byte frequency.
+static bool LooksLikeWindows1251(const std::string& bytes) {
+    size_t n = bytes.size();
+    if (n == 0) return false;
+    size_t badSeq = 0;      // invalid UTF-8 sequences
+    size_t hiCyr = 0;       // bytes in 0xC0..0xFF (CP1251 Cyrillic range)
+    for (size_t i = 0; i < n; i++) {
+        unsigned char c = (unsigned char)bytes[i];
+        if (c < 0x80) continue;
+        if (c >= 0xC0) hiCyr++;
+        size_t need = 0;
+        if ((c & 0xE0) == 0xC0) need = 1;
+        else if ((c & 0xF0) == 0xE0) need = 2;
+        else if ((c & 0xF8) == 0xF0) need = 3;
+        else { badSeq++; continue; }
+        bool ok = (i + need < n);
+        for (size_t k = 1; ok && k <= need; k++)
+            if (((unsigned char)bytes[i + k] & 0xC0) != 0x80) ok = false;
+        if (!ok) { badSeq++; continue; }
+        i += need;
+    }
+    // CP1251 text: many invalid sequences in the Cyrillic byte range;
+    // valid UTF-8: no invalid sequences at all.
+    if (badSeq == 0) return false;
+    return hiCyr > 0 && badSeq >= (hiCyr / 2);
+}
+
+static std::string Windows1251ToUtf8(const std::string& bytes) {
+    GError* err = NULL;
+    gsize written = 0;
+    gchar* conv = g_convert(bytes.data(), (gsize)bytes.size(),
+                            "UTF-8", "WINDOWS-1251", NULL, &written, &err);
+    std::string out = conv ? std::string(conv, written) : std::string();
+    g_free(conv);
+    if (err) g_error_free(err);
+    return out;
+}
+
+// Reads a file as UTF-8 (handles UTF-8 / UTF-16LE / UTF-16BE BOMs, and
+// Windows-1251 (Cyrillic ANSI) documents without a BOM).
 static std::string ReadFileUtf8(const std::string& path) {
     FILE* f = fopen(path.c_str(), "rb");
     if (!f) return std::string();
@@ -147,6 +230,8 @@ static std::string ReadFileUtf8(const std::string& path) {
     if (bytes.size() >= 3 && (unsigned char)bytes[0] == 0xEF &&
         (unsigned char)bytes[1] == 0xBB && (unsigned char)bytes[2] == 0xBF)
         bytes.erase(0, 3);
+    else if (!bytes.empty() && LooksLikeWindows1251(bytes))
+        return Windows1251ToUtf8(bytes);
     return bytes;  // UTF-8
 }
 
@@ -433,6 +518,7 @@ static void OpenFile(const std::string& path);
 static void EnterEditMode();
 static void LeaveEditMode();
 static void StartSmoke(GtkApplication* app);
+static void OnWebViewLoadFailed(WebKitWebView*, WebKitLoadEvent, const gchar*, const gchar*, gpointer);
 
 static void ActionSave(GtkWidget*, gpointer) {
     if (g_currentPath.empty()) {
@@ -522,6 +608,17 @@ static void LeaveEditMode() {
     SetStatus("Preview - Ctrl+E to edit, Ctrl+S to save");
 }
 
+// Returns the base URI for load_html(). Deliberately an about: URI for all
+// pages: opaque-origin pages spawn the web process reliably on every WebKitGTK
+// build we tested (2.36..2.52), while a file:// base can silently fail to load
+// (observed on WebKitGTK 2.52/WSL1: no load events at all). Relative image
+// paths are inlined as data: URIs before this point, and the document
+// directory is passed to the page JS via __mpBase, so nothing needs file://.
+static std::string BaseUriFor(const std::string& dir) {
+    (void)dir;
+    return "about:blank";
+}
+
 static void OpenFile(const std::string& path) {
     if (g_editing) LeaveEditMode();
     if (!FileExists(path)) {
@@ -537,7 +634,8 @@ static void OpenFile(const std::string& path) {
     EmbedLocalImages(body, dir);
 
     std::string html = BuildHtml(body, BaseName(path), dir);
-    webkit_web_view_load_html(WEBKIT_WEB_VIEW(g_webview), html.c_str(), "about:blank");
+    webkit_web_view_load_html(WEBKIT_WEB_VIEW(g_webview), html.c_str(),
+                              BaseUriFor(dir).c_str());
     g_currentPath = path;
     g_dirty = false;
     UpdateTitle();
@@ -566,7 +664,7 @@ static void ShowWelcome() {
     std::string body;
     MdToHtml(welcome, body);
     std::string html = BuildHtml(body, "Welcome", "");
-    webkit_web_view_load_html(WEBKIT_WEB_VIEW(g_webview), html.c_str(), "about:blank");
+    webkit_web_view_load_html(WEBKIT_WEB_VIEW(g_webview), html.c_str(), "about:markpeek");
     g_currentPath.clear();
     g_dirty = false;
     UpdateTitle();
@@ -662,32 +760,44 @@ static void Activate(GtkApplication* app, gpointer) {
     g_window = gtk_application_window_new(app);
     gtk_window_set_default_size(GTK_WINDOW(g_window), 960, 720);
 
-    GtkWidget* header = gtk_header_bar_new();
-    gtk_header_bar_set_title(GTK_HEADER_BAR(header), APP_NAME);
-    gtk_header_bar_set_show_close_button(GTK_HEADER_BAR(header), TRUE);
+    // GtkHeaderBar close button renders a themed icon; on platforms where
+    // gdk-pixbuf cannot decode icons (WSL1, minimal containers) GTK aborts.
+    // Probe once and fall back to the plain title bar when icons are broken.
+    GtkWidget* header = NULL;
+    if (IconThemeHas("window-close-symbolic")) {
+        header = gtk_header_bar_new();
+        gtk_header_bar_set_title(GTK_HEADER_BAR(header), APP_NAME);
+        gtk_header_bar_set_show_close_button(GTK_HEADER_BAR(header), TRUE);
+    }
 
-    g_btn_edit = gtk_button_new();
-    UpdateEditButton();
-    gtk_widget_set_tooltip_text(g_btn_edit, "Edit / Preview (Ctrl+E)");
-    g_signal_connect(g_btn_edit, "clicked", G_CALLBACK(ActionEditToggle), NULL);
-    gtk_header_bar_pack_start(GTK_HEADER_BAR(header), g_btn_edit);
+    if (header) {
+        g_btn_edit = gtk_button_new();
+        UpdateEditButton();
+        gtk_widget_set_tooltip_text(g_btn_edit, "Edit / Preview (Ctrl+E)");
+        g_signal_connect(g_btn_edit, "clicked", G_CALLBACK(ActionEditToggle), NULL);
+        gtk_header_bar_pack_start(GTK_HEADER_BAR(header), g_btn_edit);
 
-    GtkWidget* btn_open = gtk_button_new_from_icon_name("document-open-symbolic", GTK_ICON_SIZE_MENU);
-    gtk_widget_set_tooltip_text(btn_open, "Open (Ctrl+O)");
-    g_signal_connect(btn_open, "clicked", G_CALLBACK(ActionOpen), NULL);
-    gtk_header_bar_pack_start(GTK_HEADER_BAR(header), btn_open);
+        GtkWidget* btn_open = MakeIconButton("document-open-symbolic", "_Open");
+        gtk_widget_set_tooltip_text(btn_open, "Open (Ctrl+O)");
+        g_signal_connect(btn_open, "clicked", G_CALLBACK(ActionOpen), NULL);
+        gtk_header_bar_pack_start(GTK_HEADER_BAR(header), btn_open);
 
-    GtkWidget* btn_save = gtk_button_new_from_icon_name("document-save-symbolic", GTK_ICON_SIZE_MENU);
-    gtk_widget_set_tooltip_text(btn_save, "Save (Ctrl+S)");
-    g_signal_connect(btn_save, "clicked", G_CALLBACK(ActionSave), NULL);
-    gtk_header_bar_pack_end(GTK_HEADER_BAR(header), btn_save);
+        GtkWidget* btn_save = MakeIconButton("document-save-symbolic", "_Save");
+        gtk_widget_set_tooltip_text(btn_save, "Save (Ctrl+S)");
+        g_signal_connect(btn_save, "clicked", G_CALLBACK(ActionSave), NULL);
+        gtk_header_bar_pack_end(GTK_HEADER_BAR(header), btn_save);
 
-    GtkWidget* btn_about = gtk_button_new_from_icon_name("help-about-symbolic", GTK_ICON_SIZE_MENU);
-    gtk_widget_set_tooltip_text(btn_about, "About");
-    g_signal_connect(btn_about, "clicked", G_CALLBACK(ActionAbout), NULL);
-    gtk_header_bar_pack_end(GTK_HEADER_BAR(header), btn_about);
+        GtkWidget* btn_about = MakeIconButton("help-about-symbolic", "_About");
+        gtk_widget_set_tooltip_text(btn_about, "About");
+        g_signal_connect(btn_about, "clicked", G_CALLBACK(ActionAbout), NULL);
+        gtk_header_bar_pack_end(GTK_HEADER_BAR(header), btn_about);
 
-    gtk_window_set_titlebar(GTK_WINDOW(g_window), header);
+        gtk_window_set_titlebar(GTK_WINDOW(g_window), header);
+    } else {
+        // Broken-icon environment: plain title bar, app menu via keyboard only.
+        gtk_window_set_title(GTK_WINDOW(g_window), APP_NAME);
+        SetStatus("Icons unavailable in this environment; use Ctrl+O / Ctrl+E / Ctrl+S");
+    }
 
     g_webview = webkit_web_view_new();
     WebKitSettings* settings = webkit_web_view_get_settings(WEBKIT_WEB_VIEW(g_webview));
@@ -695,6 +805,7 @@ static void Activate(GtkApplication* app, gpointer) {
     webkit_settings_set_enable_write_console_messages_to_stdout(settings, TRUE);
     webkit_settings_set_enable_tabs_to_links(settings, FALSE);
     g_signal_connect(g_webview, "decide-policy", G_CALLBACK(OnDecidePolicy), NULL);
+    g_signal_connect(g_webview, "load-failed", G_CALLBACK(OnWebViewLoadFailed), NULL);
 
     g_status = gtk_statusbar_new();
 
@@ -729,20 +840,55 @@ static void Activate(GtkApplication* app, gpointer) {
 
 // "open" arrives when files are passed on the command line (G_APPLICATION_
 // HANDLES_OPEN); it is emitted instead of "activate", so create the UI first.
+static gboolean OpenPendingIdle(gpointer) {
+    for (const std::string& path : g_pendingOpenFiles) {
+        if (g_editing) LeaveEditMode();
+        OpenFile(path);
+    }
+    g_pendingOpenFiles.clear();
+    return G_SOURCE_REMOVE;
+}
+
 static void OnAppOpen(GtkApplication* app, GFile** files, gint n, const gchar*, gpointer) {
     Activate(app, NULL);
     for (int i = 0; i < n; i++) {
         char* p = g_file_get_path(files[i]);
         if (!p) continue;
-        std::string path = p;
+        g_pendingOpenFiles.push_back(p);
         g_free(p);
-        if (g_editing) LeaveEditMode();
-        OpenFile(path);
     }
+    if (!g_pendingOpenFiles.empty())
+        g_idle_add(OpenPendingIdle, NULL);
     if (!g_smokeJsFile.empty()) StartSmoke(app);
 }
 
+// WebKit process tuning for the AppImage: the bundled WebKitGTK may pick a
+// GPU/DMABUF renderer or bubblewrap sandbox that fails on some real systems
+// (the view then stays blank). CI-proven defaults are applied ONLY when
+// running as an AppImage (APPIMAGE env var is set) and only when the user has
+// not overridden them. Regular (non-AppImage) runs are untouched.
+static void ApplyAppImageWebKitEnv() {
+    if (!g_getenv("APPIMAGE")) return;
+    struct { const char* name; const char* value; } envs[] = {
+        { "WEBKIT_DISABLE_SANDBOX_THIS_IS_DANGEROUS", "1" },
+        { "WEBKIT_DISABLE_DMABUF_RENDERER", "1" },
+        { "LIBGL_ALWAYS_SOFTWARE", "1" },
+    };
+    for (auto& e : envs) {
+        if (!g_getenv(e.name)) g_setenv(e.name, e.value, TRUE);
+    }
+}
+
+static void OnWebViewLoadFailed(WebKitWebView*, WebKitLoadEvent, const gchar* failing,
+                                const gchar* error, gpointer) {
+    std::string msg = std::string("Page load failed: ") + (failing ? failing : "") +
+                      " - " + (error ? error : "unknown");
+    g_warning("markpeek: %s", msg.c_str());
+    SetStatus(msg);
+}
+
 int main(int argc, char** argv) {
+    ApplyAppImageWebKitEnv();
     const char* smokeJs = g_getenv("MP_SMOKE_JS");
     const char* smokeOut = g_getenv("MP_SMOKE_OUT");
     if (smokeJs && smokeOut) {

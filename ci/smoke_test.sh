@@ -3,6 +3,9 @@
 # WYSIWYG pipeline inside the page (md4c HTML, CSS, editor JS, DOM->Markdown
 # export, dirty tracking). No window server required (Xvfb).
 #
+# v1.3.1+: also checks that the page reports no error, and exercises the
+# encoding matrix (UTF-8, UTF-8 BOM, Windows-1251, UTF-16LE) with Cyrillic.
+#
 # Usage: ci/smoke_test.sh [path-to-markpeek-binary] [sample.md]
 set -u
 
@@ -41,6 +44,18 @@ try {
 JSON.stringify(res);
 EOF
 
+# Check JS for encoding-variant runs: text must survive the round trip.
+cat > "$TMP/check-enc.js" <<'EOF'
+var c = document.getElementById("markpeek-content");
+var t = c.textContent || "";
+var res = {
+  hasContent: !!c && c.children.length > 0,
+  hasCyrillic: /[А-Яа-яЁё]/.test(t),
+  textLen: t.length
+};
+JSON.stringify(res);
+EOF
+
 echo "== MarkPeek smoke test =="
 echo "binary: $BIN"
 ls -l "$BIN"
@@ -50,28 +65,31 @@ if [ ! -f "$SAMPLE" ]; then
   exit 2
 fi
 
-# Run MarkPeek with sample.md on a virtual display. MP_SMOKE_JS/MP_SMOKE_OUT
-# make the app itself evaluate our check after the page renders and print the
-# JSON result to the output file (built-in hook, see src/linux/main_gtk.cpp).
-echo "note: page-level checks run through the built-in MP_SMOKE hook"
-
-export MP_SMOKE_JS="$TMP/check.js"
-export MP_SMOKE_OUT="$TMP/result.json"
-export MP_SMOKE_FILE="$(pwd)/$SAMPLE"
-
-# WebKit2GTK in containers: disable bubblewrap sandbox and DMABUF renderer
-# (no user namespaces / no GPU in CI); force software rendering via Xvfb.
+# WebKit2GTK in containers/WSL: disable bubblewrap sandbox and DMABUF renderer
+# (no user namespaces / no GPU); force software rendering via Xvfb.
 export WEBKIT_DISABLE_SANDBOX_THIS_IS_DANGEROUS=1
 export WEBKIT_DISABLE_DMABUF_RENDERER=1
 export LIBGL_ALWAYS_SOFTWARE=1
 export GDK_BACKEND=x11
 
-xvfb-run -a -s "-screen 0 1280x800x24" "$BIN" "$MP_SMOKE_FILE" >"$TMP/app.log" 2>&1
-RC=$?
-SMOKE_OUT_CONTENT=""
-if [ -f "$TMP/result.json" ]; then SMOKE_OUT_CONTENT="$(cat "$TMP/result.json")"; fi
-unset MP_SMOKE_JS MP_SMOKE_OUT MP_SMOKE_FILE
-unset WEBKIT_DISABLE_SANDBOX_THIS_IS_DANGEROUS WEBKIT_DISABLE_DMABUF_RENDERER LIBGL_ALWAYS_SOFTWARE GDK_BACKEND
+SMK_RC=0
+SMK_OUT=""
+run_smoke() {
+  local checkjs="$1" samplefile="$2" outfile="$3"
+  export MP_SMOKE_JS="$checkjs"
+  export MP_SMOKE_OUT="$outfile"
+  export MP_SMOKE_FILE="$(cd "$(dirname "$samplefile")" && pwd)/$(basename "$samplefile")"
+  xvfb-run -a -s "-screen 0 1280x800x24" "$BIN" "$MP_SMOKE_FILE" >"$TMP/app.log" 2>&1
+  SMK_RC=$?
+  SMK_OUT=""
+  if [ -f "$outfile" ]; then SMK_OUT="$(cat "$outfile")"; fi
+  unset MP_SMOKE_JS MP_SMOKE_OUT MP_SMOKE_FILE
+}
+
+# --- main sample run ---
+run_smoke "$TMP/check.js" "$SAMPLE" "$TMP/result.json"
+RC=$SMK_RC
+SMOKE_OUT_CONTENT="$SMK_OUT"
 
 echo "--- app log (first 20 lines) ---"
 head -20 "$TMP/app.log"
@@ -103,6 +121,29 @@ for kv in hasContent:true hasH1:true hasTable:true hasCode:true \
   fi
 done
 grep -q '"error"' "$MP_SMOKE_OUT" && { echo "CHECK FAILED: page JS error"; PASS=0; }
+
+# --- encoding matrix (UTF-8 / UTF-8 BOM / CP1251 / UTF-16LE with Cyrillic) ---
+if command -v python3 >/dev/null 2>&1; then
+  python3 - "$TMP" <<'PYEOF'
+import sys, pathlib
+tmp = pathlib.Path(sys.argv[1])
+text = "# Заголовок\n\nКириллица: привет, мир. Ёжик и ёлка.\n"
+(tmp / "enc_utf8.md").write_bytes(text.encode("utf-8"))
+(tmp / "enc_bom.md").write_bytes(b"\xef\xbb\xbf" + text.encode("utf-8"))
+(tmp / "enc_cp1251.md").write_bytes(text.encode("cp1251"))
+(tmp / "enc_u16le.md").write_bytes(b"\xff\xfe" + text.encode("utf-16-le"))
+PYEOF
+  for f in enc_utf8 enc_bom enc_cp1251 enc_u16le; do
+    run_smoke "$TMP/check-enc.js" "$TMP/$f.md" "$TMP/$f.json"
+    echo "--- encoding $f: rc=$SMK_RC $SMK_OUT ---"
+    if [ "$SMK_RC" -ne 0 ]; then echo "CHECK FAILED: $f app rc=$SMK_RC"; PASS=0; continue; fi
+    if [ -z "$SMK_OUT" ]; then echo "CHECK FAILED: $f no result"; PASS=0; continue; fi
+    grep -q '"hasContent":true' <<<"$SMK_OUT" || { echo "CHECK FAILED: $f hasContent"; PASS=0; }
+    grep -q '"hasCyrillic":true' <<<"$SMK_OUT" || { echo "CHECK FAILED: $f hasCyrillic (decoding broken?)"; PASS=0; }
+  done
+else
+  echo "note: python3 not available, skipping encoding matrix"
+fi
 
 if [ "$PASS" -eq 1 ]; then
   echo "SMOKE TEST: PASS"

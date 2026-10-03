@@ -1,0 +1,4 @@
+MarkPeek (Linux) - portable build v1.3.1
+1) tar xf markpeek-*.tar.gz
+2) ./markpeek-*/markpeek [file.md]
+Dependencies: GTK 3 and WebKit2GTK (4.0 or 4.1).

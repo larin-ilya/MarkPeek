@@ -12,8 +12,11 @@
 CXX      ?= g++
 CXXFLAGS ?= -O2
 WARN      = -Wall -Wextra -Wno-unused-parameter
-GTK       = $(shell pkg-config --cflags gtk+-3.0 webkit2gtk-4.0)
-GTKLIBS   = $(shell pkg-config --libs   gtk+-3.0 webkit2gtk-4.0)
+# WebKitGTK API version auto-detection: 4.0 (Debian/Ubuntu <= 23.04,
+# libsoup2), 4.1 (libsoup3, current Debian/Fedora/Arch/Ubuntu 24.04+).
+WEBKIT_API := $(shell pkg-config --exists webkit2gtk-4.0 && echo webkit2gtk-4.0 || echo webkit2gtk-4.1)
+GTK       = $(shell pkg-config --cflags gtk+-3.0 $(WEBKIT_API))
+GTKLIBS   = $(shell pkg-config --libs   gtk+-3.0 $(WEBKIT_API))
 
 SRCDIR    = src
 OUTDIR    = dist

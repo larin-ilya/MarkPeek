@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=MarkPeek
+GenericName=Markdown Viewer
+Comment=A minimal Typora-style Markdown viewer & editor
+Exec=markpeek %F
+Icon=markpeek
+Terminal=false
+Categories=Office;TextEditor;Utility;
+MimeType=text/markdown;text/x-markdown;
+Keywords=markdown;viewer;editor;md;
